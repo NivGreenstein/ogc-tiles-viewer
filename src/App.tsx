@@ -19,7 +19,7 @@ import { get as getProjection } from 'ol/proj'
 import proj4 from 'proj4'
 import './App.css'
 
-type Link = { href: string; rel?: string; type?: string; title?: string }
+type Link = { href: string; rel?: string; type?: string; title?: string; templated?: boolean }
 type Tileset = { id: string; title: string; description?: string; dataType?: string; crs?: string; tileMatrixSetId?: string; boundingBox?: { lowerLeft: number[]; upperRight: number[]; crs?: string }; links: Link[] }
 type TileMatrix = { id: string; scaleDenominator: number; cellSize?: number; pointOfOrigin: number[]; tileWidth: number; tileHeight: number; matrixWidth: number; matrixHeight: number }
 type MatrixSet = { id: string; title?: string; crs: string; tileMatrices: TileMatrix[] }
@@ -31,6 +31,12 @@ const storedKey = 'ogc-tiles-viewer-state'
 const absolute = (href: string, base: string) => new URL(href, base).toString().replace(/%7B/gi, '{').replace(/%7D/gi, '}')
 const byRel = (links: Link[], rels: string[]) => links.find((link) => rels.includes(link.rel ?? ''))
 const title = (value: Record<string, unknown>, fallback: string) => String(value.title ?? value.id ?? value.name ?? fallback)
+
+function withTileFormat(template: string, format: string) {
+  const url = new URL(template)
+  url.searchParams.set('f', format)
+  return url.toString().replace(/%7B/gi, '{').replace(/%7D/gi, '}')
+}
 
 async function getJson(url: string, diagnostics: Diagnostic[]) {
   try {
@@ -57,6 +63,17 @@ function parseTileset(raw: Record<string, unknown>, base: string): Tileset {
 async function discover(endpoint: string, diagnostics: Diagnostic[]) {
   const landing = await getJson(endpoint, diagnostics)
   const links = (landing.links as Link[] | undefined) ?? []
+  const serviceDescription = byRel(links, ['service-desc'])
+  let tileFormats: string[] = []
+  if (serviceDescription) {
+    try {
+      const api = await getJson(absolute(serviceDescription.href, endpoint), diagnostics)
+      const parameters = ((api.components as Record<string, unknown> | undefined)?.parameters as Record<string, Record<string, unknown>> | undefined)
+      const tileFormat = parameters?.fTile
+      const schema = tileFormat?.schema as Record<string, unknown> | undefined
+      tileFormats = ((schema?.enum as unknown[] | undefined) ?? []).filter((format): format is string => typeof format === 'string')
+    } catch { /* discovery remains usable when the optional OpenAPI document cannot be read */ }
+  }
   const tilesetsLink = byRel(links, ['http://www.opengis.net/def/rel/ogc/1.0/tilesets', 'tilesets', 'http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector', 'tilesets-vector'])
   const collectionLinks = links.filter((link) => link.rel === 'item' || link.rel === 'collection')
   const dataLink = byRel(links, ['data'])
@@ -89,7 +106,15 @@ async function discover(endpoint: string, diagnostics: Diagnostic[]) {
       } catch { /* diagnostics records the failed collection request */ }
     }
   }
-  return sets.filter((set) => !set.dataType || set.dataType.toLowerCase() === 'vector')
+  return sets.filter((set) => !set.dataType || set.dataType.toLowerCase() === 'vector').map((set) => {
+    if (!tileFormats.length) return set
+    return {
+      ...set,
+      links: set.links.flatMap((link) => link.rel === 'item' && link.templated
+        ? tileFormats.map((format) => ({ ...link, href: withTileFormat(link.href, format), type: link.type ?? `application/x-${format}`, title: format.toUpperCase() }))
+        : [link]),
+    }
+  })
 }
 
 async function loadMatrixSet(tileset: Tileset, matrixUrl: string | undefined, diagnostics: Diagnostic[]) {
