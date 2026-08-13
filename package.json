@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "ol": "^10.10.0",
+    "ol-mapbox-style": "^13.4.2",
     "proj4": "^2.21.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
