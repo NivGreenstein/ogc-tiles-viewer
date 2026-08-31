@@ -15,7 +15,8 @@ The viewer does not need a backend or proxy. It follows links advertised by an O
 - Prompt before switching to a tileset with a different map CRS; accepting clears incompatible active layers.
 - Inspect all vector features hit by a map click and view their raw properties.
 - Show metadata, request diagnostics, scale, CRS, and a Z/X/Y debug grid.
-- Use a generated geometry-aware style when no style URL is supplied.
+- Apply a MapLibre style, pasted or fetched from a URL, without replacing the discovered OGC source.
+- Use a generated geometry-aware style when no style is supplied.
 
 ## Run Locally
 
@@ -81,9 +82,15 @@ For an EPSG code that OpenLayers does not include, the viewer fetches its Proj4 
 
 ## Styles
 
-Leave the style URL empty to use a random local style. It assigns colors based on geometry type without changing the tileset source.
+The **STYLE** field accepts a MapLibre style URL or a pasted MapLibre style document. Selecting **APPLY** draws every active layer with that style through `ol-mapbox-style`.
 
-The **STYLE** URL field currently validates a MapLibre style JSON document but intentionally keeps the OGC API Tiles source and its native grid authoritative. MapLibre source definitions are not applied because they can overwrite the discovered OGC tile template.
+Only the style layers of a single source are applied, because one OGC tileset backs one OpenLayers vector tile layer. The source that the most style layers draw from is chosen, and its id is reported next to the **STYLE** heading. The `source-layer` names it references must match the layer names inside the vector tiles; when they do not, the style draws nothing, so the referenced source-layers are listed in the message area to make a mismatch visible.
+
+While a style is applied the map backdrop turns white, because MapLibre styles are written for a light background. The generated style keeps the dark workspace backdrop.
+
+The OGC API Tiles source and its native grid stay authoritative. MapLibre `sources` definitions are never applied, so the advertised tile template, tile matrix set, and CRS are preserved.
+
+Empty the field and select **APPLY** to return to the generated style. It colors features by geometry type, using a hue derived from the layer key so a layer keeps the same color across re-renders.
 
 ## Diagnostics And Browser Constraints
 

@@ -17,6 +17,7 @@ import { defaults as defaultControls, ScaleLine } from 'ol/control'
 import { register } from 'ol/proj/proj4'
 import { get as getProjection } from 'ol/proj'
 import proj4 from 'proj4'
+import { applyStyle } from 'ol-mapbox-style'
 import './App.css'
 
 type Link = { href: string; rel?: string; type?: string; title?: string; templated?: boolean }
@@ -26,16 +27,36 @@ type MatrixSet = { id: string; title?: string; crs: string; tileMatrices: TileMa
 type Diagnostic = { at: string; url: string; status: string; detail: string }
 type ActiveLayer = { key: string; tileset: Tileset; matrixSet: MatrixSet; tileUrl: string }
 type Choice = { tileUrl: string; matrixUrl: string }
+type GlStyle = Parameters<typeof applyStyle>[1]
+type AppliedStyle = { document: GlStyle; source: string; styleUrl?: string; layerCount: number; sourceLayers: string[] }
 
 const storedKey = 'ogc-tiles-viewer-state'
 const absolute = (href: string, base: string) => new URL(href, base).toString().replace(/%7B/gi, '{').replace(/%7D/gi, '}')
 const byRel = (links: Link[], rels: string[]) => links.find((link) => rels.includes(link.rel ?? ''))
 const title = (value: Record<string, unknown>, fallback: string) => String(value.title ?? value.id ?? value.name ?? fallback)
+const hueFor = (key: string) => [...key].reduce((hue, character) => (hue * 31 + character.charCodeAt(0)) % 360, 7)
 
 function withTileFormat(template: string, format: string) {
   const url = new URL(template)
   url.searchParams.set('f', format)
   return url.toString().replace(/%7B/gi, '{').replace(/%7D/gi, '}')
+}
+
+// A MapLibre document can declare several sources, but one OGC tileset backs one vector tile layer,
+// so the style layers of a single source are applied and the advertised tile template is kept.
+function chooseStyleSource(styleDocument: Record<string, unknown>): Omit<AppliedStyle, 'document' | 'styleUrl'> {
+  const sources = (styleDocument.sources as Record<string, Record<string, unknown>> | undefined) ?? {}
+  const styleLayers = (styleDocument.layers as Record<string, unknown>[] | undefined) ?? []
+  const ids = Object.keys(sources)
+  if (!ids.length) throw new Error('This document declares no sources, so it is not a MapLibre style.')
+  const vectorIds = ids.filter((id) => (sources[id]?.type ?? 'vector') === 'vector')
+  const ranked = (vectorIds.length ? vectorIds : ids)
+    .map((id) => ({ id, drawn: styleLayers.filter((styleLayer) => styleLayer.source === id) }))
+    .sort((a, b) => b.drawn.length - a.drawn.length)
+  const [best] = ranked
+  if (!best.drawn.length) throw new Error(`No style layer draws from \u201C${best.id}\u201D, so this style would render nothing.`)
+  const sourceLayers = [...new Set(best.drawn.map((styleLayer) => String(styleLayer['source-layer'] ?? '')).filter(Boolean))]
+  return { source: best.id, layerCount: best.drawn.length, sourceLayers }
 }
 
 async function getJson(url: string, diagnostics: Diagnostic[]) {
@@ -157,6 +178,7 @@ function App() {
   const mapElement = useRef<HTMLDivElement>(null)
   const popupElement = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
+  const viewKeyRef = useRef('')
   const [endpoint, setEndpoint] = useState(() => new URLSearchParams(location.search).get('endpoint') ?? localStorage.getItem(storedKey) ?? '')
   const [tilesets, setTilesets] = useState<Tileset[]>([])
   const [active, setActive] = useState<ActiveLayer[]>([])
@@ -168,8 +190,8 @@ function App() {
   const [hits, setHits] = useState<Record<string, unknown>[]>([])
   const [selectedHit, setSelectedHit] = useState(0)
   const [openMatrixSets, setOpenMatrixSets] = useState<Record<string, boolean>>({})
-  const [styleUrl, setStyleUrl] = useState('')
-  const [styleVersion, setStyleVersion] = useState(0)
+  const [styleInput, setStyleInput] = useState('')
+  const [appliedStyle, setAppliedStyle] = useState<AppliedStyle | null>(null)
   const [showTileDebug, setShowTileDebug] = useState(true)
   const groupedTilesets = tilesets.reduce<Record<string, Tileset[]>>((groups, set) => {
     const matrixSet = set.tileMatrixSetId ?? 'Unspecified tile matrix set'
@@ -228,14 +250,27 @@ function App() {
   }
 
   async function loadStyle() {
-    if (!styleUrl) return
+    const value = styleInput.trim()
+    if (!value) {
+      setAppliedStyle(null)
+      setMessage('Style cleared. Active layers use the generated geometry style.')
+      return
+    }
     try {
-      const response = await fetch(styleUrl)
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
-      await response.json()
-      setStyleUrl('')
-      setStyleVersion((version) => version + 1)
-      setMessage('Style document is valid. This viewer keeps its OGC API Tiles source and applied a random local style.')
+      let styleDocument: Record<string, unknown>
+      let styleUrl: string | undefined
+      if (value.startsWith('{')) styleDocument = JSON.parse(value) as Record<string, unknown>
+      else {
+        styleUrl = new URL(value).toString()
+        const response = await fetch(styleUrl)
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
+        styleDocument = (await response.json()) as Record<string, unknown>
+      }
+      const chosen = chooseStyleSource(styleDocument)
+      setAppliedStyle({ document: styleDocument as GlStyle, styleUrl, ...chosen })
+      const drawn = `${chosen.layerCount} style layer${chosen.layerCount === 1 ? '' : 's'} from source \u201C${chosen.source}\u201D`
+      const expects = chosen.sourceLayers.length ? ` It draws source-layers ${chosen.sourceLayers.slice(0, 8).join(', ')}; a tileset without them renders empty.` : ''
+      setMessage(active.length ? `Applied ${drawn}.${expects}` : `Loaded ${drawn}. Add a tileset to draw it.`)
     } catch (error) { setMessage(`Could not load style: ${error instanceof Error ? error.message : String(error)}`) }
   }
 
@@ -244,21 +279,42 @@ function App() {
     if (!map || !active.length) return
     const projection = getProjection(active[0].matrixSet.crs)
     if (!projection) return
-    map.setView(new View({ projection, center: active[0].tileset.boundingBox?.lowerLeft ?? [0, 0], zoom: 0 }))
+    let stale = false
+    const box = active[0].tileset.boundingBox
+    const viewKey = `${active[0].matrixSet.crs}|${active.map((layer) => layer.key).join(',')}`
+    if (viewKeyRef.current !== viewKey) {
+      viewKeyRef.current = viewKey
+      map.setView(new View({ projection, center: box?.lowerLeft ?? [0, 0], zoom: 0 }))
+      if (box?.lowerLeft.length === 2 && box.upperRight.length === 2 && (!box.crs || box.crs === active[0].matrixSet.crs)) map.getView().fit([...box.lowerLeft, ...box.upperRight], { padding: [50, 50, 50, 330], duration: 300 })
+    }
     map.getLayers().clear()
     for (const layer of active) {
       const matrices = layer.matrixSet.tileMatrices
       const meters = projection.getMetersPerUnit() ?? 1
       const grid = new TileGrid({ extent: layer.tileset.boundingBox && (!layer.tileset.boundingBox.crs || layer.tileset.boundingBox.crs === layer.matrixSet.crs) ? [...layer.tileset.boundingBox.lowerLeft, ...layer.tileset.boundingBox.upperRight] : undefined, origins: matrices.map((m) => m.pointOfOrigin), resolutions: matrices.map((m) => m.cellSize || m.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((m) => [m.tileWidth, m.tileHeight]) })
-      const vectorLayer = new VectorTileLayer({ source: new VectorTileSource({ format: new MVT(), projection, tileGrid: grid, tileUrlFunction: ([z, x, y]) => layer.tileUrl.replace(/\{tileMatrix\}/gi, matrices[z].id).replace(/\{tileCol\}/gi, String(x)).replace(/\{tileRow\}/gi, String(y)) }) })
-      if (!styleUrl) {
-        const hue = Math.floor(Math.random() * 360)
-        vectorLayer.setStyle((feature) => {
-          const geometry = feature.getGeometry()?.getType()
-          const color = `hsl(${hue}, 68%, 54%)`
-          if (geometry?.includes('Point')) return new Style({ image: new CircleStyle({ radius: 5, fill: new Fill({ color }), stroke: new Stroke({ color: '#1a1e1b', width: 1 }) }) })
-          if (geometry?.includes('Line')) return new Style({ stroke: new Stroke({ color, width: 2 }) })
-          return new Style({ fill: new Fill({ color: `hsla(${hue}, 68%, 54%, .55)` }), stroke: new Stroke({ color, width: 1 }) })
+      const source = new VectorTileSource({ format: new MVT(), projection, tileGrid: grid, tileUrlFunction: ([z, x, y]) => layer.tileUrl.replace(/\{tileMatrix\}/gi, matrices[z].id).replace(/\{tileCol\}/gi, String(x)).replace(/\{tileRow\}/gi, String(y)) })
+      const tileUrlFunction = source.getTileUrlFunction()
+      const vectorLayer = new VectorTileLayer({ source, declutter: Boolean(appliedStyle) })
+      const hue = hueFor(layer.key)
+      vectorLayer.setStyle((feature) => {
+        const geometry = feature.getGeometry()?.getType()
+        const color = `hsl(${hue}, 68%, 54%)`
+        if (geometry?.includes('Point')) return new Style({ image: new CircleStyle({ radius: 5, fill: new Fill({ color }), stroke: new Stroke({ color: '#1a1e1b', width: 1 }) }) })
+        if (geometry?.includes('Line')) return new Style({ stroke: new Stroke({ color, width: 2 }) })
+        return new Style({ fill: new Fill({ color: `hsla(${hue}, 68%, 54%, .55)` }), stroke: new Stroke({ color, width: 1 }) })
+      })
+      if (appliedStyle) {
+        const options = { source: appliedStyle.source, updateSource: false, ...(appliedStyle.styleUrl ? { styleUrl: appliedStyle.styleUrl } : {}) }
+        void applyStyle(vectorLayer, appliedStyle.document, options).then(() => {
+          if (stale) return
+          // The advertised OGC template stays authoritative, so a MapLibre source definition never replaces it.
+          if (vectorLayer.getSource() !== source) vectorLayer.setSource(source)
+          if (source.getTileUrlFunction() !== tileUrlFunction) source.setTileUrlFunction(tileUrlFunction)
+        }).catch((error: unknown) => {
+          if (stale) return
+          const detail = error instanceof Error ? error.message : String(error)
+          setDiagnostics((current) => [...current, { at: new Date().toLocaleTimeString(), url: appliedStyle.styleUrl ?? 'pasted style document', status: 'Style could not be applied', detail }])
+          setMessage(`Could not apply the style to ${layer.tileset.title}: ${detail}`)
         })
       }
       map.addLayer(vectorLayer)
@@ -269,17 +325,16 @@ function App() {
       const grid = new TileGrid({ origins: matrices.map((matrix) => matrix.pointOfOrigin), resolutions: matrices.map((matrix) => matrix.cellSize || matrix.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((matrix) => [matrix.tileWidth, matrix.tileHeight]) })
       map.addLayer(new TileLayer({ source: new TileDebug({ projection, tileGrid: grid }) }))
     }
-    const box = active[0].tileset.boundingBox
-    if (box?.lowerLeft.length === 2 && box.upperRight.length === 2 && (!box.crs || box.crs === active[0].matrixSet.crs)) map.getView().fit([...box.lowerLeft, ...box.upperRight], { padding: [50, 50, 50, 330], duration: 300 })
-  }, [active, styleUrl, styleVersion, showTileDebug])
+    return () => { stale = true }
+  }, [active, appliedStyle, showTileDebug])
 
   return <main className="app">
     <header><div className="brand"><span>OGC</span> TILES / VECTOR WORKBENCH</div><div className="status"><i /> {active.length ? `${active.length} ACTIVE LAYER${active.length > 1 ? 'S' : ''}` : 'NO LAYERS ACTIVE'}</div></header>
     <aside className="sidebar"><form onSubmit={submit}><label htmlFor="endpoint">API LANDING PAGE</label><div className="endpoint"><input id="endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://example.org/ogc" /><button disabled={loading}>{loading ? '...' : 'DISCOVER'}</button></div></form>
-      <p className="message">{message}</p><section><h2>STYLE</h2><div className="endpoint"><input aria-label="MapLibre style URL" value={styleUrl} onChange={(event) => setStyleUrl(event.target.value)} placeholder="Optional MapLibre style URL" /><button type="button" onClick={() => void loadStyle()}>APPLY</button></div><small>Blank uses a random local style.</small></section><label className="debug-toggle"><input type="checkbox" checked={showTileDebug} onChange={(event) => setShowTileDebug(event.target.checked)} /> SHOW Z/X/Y TILE GRID</label><section><h2>CATALOG <b>{tilesets.length}</b></h2>{Object.entries(groupedTilesets).sort(([a], [b]) => a.localeCompare(b)).map(([matrixSet, entries]) => <details className="matrix-group" key={matrixSet} open={openMatrixSets[matrixSet] ?? true} onToggle={(event) => { const isOpen = event.currentTarget.open; setOpenMatrixSets((current) => ({ ...current, [matrixSet]: isOpen })) }}><summary>{matrixSet} <b>{entries.length}</b></summary>{entries.map((set) => { const tileLinks = set.links.filter((link) => ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'].includes(link.rel ?? '')); const matrixLinks = set.links.filter((link) => ['http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme', 'tiling-scheme', 'tileMatrixSet'].includes(link.rel ?? '')); const choice = choices[set.id]; return <article className="tileset catalog-item" key={set.id}><div><strong>{set.title}</strong><small>{set.dataType ?? 'vector'} · {set.crs ?? 'CRS from matrix set'}</small>{tileLinks.length > 0 && <select aria-label={`Tile format for ${set.title}`} value={choice?.tileUrl ?? tileLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: e.target.value, matrixUrl: choice?.matrixUrl ?? matrixLinks[0]?.href ?? '' } }))}>{tileLinks.map((link) => <option key={link.href} value={link.href}>{link.title ? `${link.title} (${link.type ?? 'format unspecified'})` : link.type ?? 'Format unspecified'}</option>)}</select>}{matrixLinks.length > 1 && <select value={choice?.matrixUrl ?? matrixLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: choice?.tileUrl ?? tileLinks[0]?.href ?? '', matrixUrl: e.target.value } }))}>{matrixLinks.map((link) => <option key={link.href} value={link.href}>{link.title ?? link.href}</option>)}</select>}</div><button className="info" onClick={() => setMetadata(set)}>i</button><button className="add" onClick={() => void addLayer(set)} aria-label={`Add ${set.title}`}>+</button></article> })}</details>)}</section>
+      <p className="message">{message}</p><section><h2>STYLE {appliedStyle && <b>{appliedStyle.layerCount}</b>}</h2><div className="endpoint style"><textarea aria-label="MapLibre style URL or document" value={styleInput} onChange={(event) => setStyleInput(event.target.value)} placeholder="MapLibre style URL, or paste a style JSON document" spellCheck={false} /><button type="button" onClick={() => void loadStyle()}>APPLY</button></div><small>{appliedStyle ? `Drawing source \u201C${appliedStyle.source}\u201D. Empty the field and select APPLY for the generated style.` : 'Blank uses a generated style colored by geometry type.'}</small></section><label className="debug-toggle"><input type="checkbox" checked={showTileDebug} onChange={(event) => setShowTileDebug(event.target.checked)} /> SHOW Z/X/Y TILE GRID</label><section><h2>CATALOG <b>{tilesets.length}</b></h2>{Object.entries(groupedTilesets).sort(([a], [b]) => a.localeCompare(b)).map(([matrixSet, entries]) => <details className="matrix-group" key={matrixSet} open={openMatrixSets[matrixSet] ?? true} onToggle={(event) => { const isOpen = event.currentTarget.open; setOpenMatrixSets((current) => ({ ...current, [matrixSet]: isOpen })) }}><summary>{matrixSet} <b>{entries.length}</b></summary>{entries.map((set) => { const tileLinks = set.links.filter((link) => ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'].includes(link.rel ?? '')); const matrixLinks = set.links.filter((link) => ['http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme', 'tiling-scheme', 'tileMatrixSet'].includes(link.rel ?? '')); const choice = choices[set.id]; return <article className="tileset catalog-item" key={set.id}><div><strong>{set.title}</strong><small>{set.dataType ?? 'vector'} · {set.crs ?? 'CRS from matrix set'}</small>{tileLinks.length > 0 && <select aria-label={`Tile format for ${set.title}`} value={choice?.tileUrl ?? tileLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: e.target.value, matrixUrl: choice?.matrixUrl ?? matrixLinks[0]?.href ?? '' } }))}>{tileLinks.map((link) => <option key={link.href} value={link.href}>{link.title ? `${link.title} (${link.type ?? 'format unspecified'})` : link.type ?? 'Format unspecified'}</option>)}</select>}{matrixLinks.length > 1 && <select value={choice?.matrixUrl ?? matrixLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: choice?.tileUrl ?? tileLinks[0]?.href ?? '', matrixUrl: e.target.value } }))}>{matrixLinks.map((link) => <option key={link.href} value={link.href}>{link.title ?? link.href}</option>)}</select>}</div><button className="info" onClick={() => setMetadata(set)}>i</button><button className="add" onClick={() => void addLayer(set)} aria-label={`Add ${set.title}`}>+</button></article> })}</details>)}</section>
       <section><h2>LAYERS <b>{active.length}</b></h2>{active.map((layer) => <article className="tileset active" key={layer.key}><div><strong>{layer.tileset.title}</strong><small>{layer.matrixSet.id} · {layer.matrixSet.crs}</small></div><button className="remove" onClick={() => setActive((layers) => layers.filter((item) => item.key !== layer.key))}>REMOVE</button></article>)}</section>
       <details><summary>DEVELOPER DIAGNOSTICS <b>{diagnostics.length}</b></summary>{diagnostics.length ? diagnostics.map((d, i) => <pre key={i}>{d.at} {d.status}\n{d.url}\n{d.detail}</pre>) : <p>No request failures recorded.</p>}</details></aside>
-    <div className="map-wrap"><div ref={mapElement} className="map" /><div className="map-caption">{active[0]?.matrixSet.crs ?? 'NO ACTIVE CRS'}</div><div ref={popupElement} className="popup">{hits.length > 0 && <><header><strong>{hits.length} FEATURE{hits.length > 1 ? 'S' : ''}</strong><select value={selectedHit} onChange={(e) => setSelectedHit(Number(e.target.value))}>{hits.map((_, i) => <option key={i} value={i}>Feature {i + 1}</option>)}</select></header><pre>{JSON.stringify(hits[selectedHit], null, 2)}</pre></>}</div></div>
+    <div className="map-wrap"><div ref={mapElement} className={appliedStyle ? 'map styled' : 'map'} /><div className="map-caption">{active[0]?.matrixSet.crs ?? 'NO ACTIVE CRS'}</div><div ref={popupElement} className="popup">{hits.length > 0 && <><header><strong>{hits.length} FEATURE{hits.length > 1 ? 'S' : ''}</strong><select value={selectedHit} onChange={(e) => setSelectedHit(Number(e.target.value))}>{hits.map((_, i) => <option key={i} value={i}>Feature {i + 1}</option>)}</select></header><pre>{JSON.stringify(hits[selectedHit], null, 2)}</pre></>}</div></div>
     {metadata && <div className="modal-backdrop" onClick={() => setMetadata(null)}><section className="modal" onClick={(e) => e.stopPropagation()}><button onClick={() => setMetadata(null)}>CLOSE</button><h2>{metadata.title}</h2><p>{metadata.description ?? 'No description advertised.'}</p><dl><dt>CRS</dt><dd>{metadata.crs ?? 'Advertised by selected tile matrix set'}</dd><dt>EXTENT</dt><dd>{metadata.boundingBox ? `${metadata.boundingBox.lowerLeft.join(', ')} / ${metadata.boundingBox.upperRight.join(', ')}` : 'Not advertised'}</dd><dt>LINKS</dt><dd>{metadata.links.map((link) => `${link.rel ?? 'link'}: ${link.title ?? link.href}`).join('\n')}</dd></dl></section></div>}
   </main>
 }

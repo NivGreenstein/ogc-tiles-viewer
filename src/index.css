@@ -3,7 +3,7 @@
 :root { color: #dce4da; background: #111714; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-synthesis: none; }
 * { box-sizing: border-box; }
 body { min-width: 960px; margin: 0; background: #111714; }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }
 
 .app { height: 100vh; display: grid; grid-template-columns: 352px minmax(0, 1fr); grid-template-rows: 56px minmax(0, 1fr); overflow: hidden; }
@@ -18,10 +18,12 @@ header { grid-column: 1 / -1; display: flex; align-items: center; justify-conten
 .sidebar::-webkit-scrollbar-thumb { background: #3a4a40; border-radius: 10px; }
 label, h2, summary { color: #aab6aa; font: 700 10px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .13em; }
 .endpoint { display: flex; gap: 7px; margin-top: 8px; }
-input, select { min-width: 0; border: 1px solid #405148; border-radius: 5px; color: #eef5eb; background: #0d1210; outline: none; transition: border-color 150ms, background 150ms; }
+input, select, textarea { min-width: 0; border: 1px solid #405148; border-radius: 5px; color: #eef5eb; background: #0d1210; outline: none; transition: border-color 150ms, background 150ms; }
 input { flex: 1; padding: 10px 11px; }
-input::placeholder { color: #69776d; }
-input:focus, select:focus { border-color: #c8f261; background: #101712; box-shadow: 0 0 0 3px #c8f26118; }
+input::placeholder, textarea::placeholder { color: #69776d; }
+input:focus, select:focus, textarea:focus { border-color: #c8f261; background: #101712; box-shadow: 0 0 0 3px #c8f26118; }
+.endpoint.style textarea { flex: 1; height: 92px; padding: 9px 10px; font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; resize: vertical; }
+.endpoint.style button { align-self: flex-start; height: 38px; }
 .endpoint button, .add { border: 0; border-radius: 5px; color: #1a2415; background: #c8f261; font-weight: 800; letter-spacing: .04em; transition: background 150ms, transform 150ms; }
 .endpoint button { padding: 0 12px; font-size: 10px; }
 .endpoint button:hover, .add:hover { background: #dafb83; transform: translateY(-1px); }
@@ -59,6 +61,7 @@ details pre { padding: 9px; border-left: 2px solid #d17b61; background: #111614;
 
 .map-wrap { position: relative; overflow: hidden; background: #24352d; }
 .map { width: 100%; height: 100%; background: radial-gradient(circle at 45% 35%, #33483b, #1c2a23); }
+.map.styled { background: #fff; }
 .map .ol-zoom { top: 16px; left: 16px; border: 1px solid #45574d; border-radius: 6px; overflow: hidden; box-shadow: 0 4px 14px #0007; }
 .map .ol-control button { width: 31px; height: 31px; color: #e9f0e7; background: #152019eF; }
 .map .ol-control button:hover { background: #304331; }
