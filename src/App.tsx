@@ -1,224 +1,84 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import Map from 'ol/Map'
-import View from 'ol/View'
-import VectorTileLayer from 'ol/layer/VectorTile'
-import TileLayer from 'ol/layer/Tile'
-import VectorTileSource from 'ol/source/VectorTile'
-import TileDebug from 'ol/source/TileDebug'
-import MVT from 'ol/format/MVT'
-import Style from 'ol/style/Style'
-import Fill from 'ol/style/Fill'
-import Stroke from 'ol/style/Stroke'
-import CircleStyle from 'ol/style/Circle'
-import TileGrid from 'ol/tilegrid/TileGrid'
-import Overlay from 'ol/Overlay'
-import { defaults as defaultControls, ScaleLine } from 'ol/control'
-import { register } from 'ol/proj/proj4'
-import { get as getProjection } from 'ol/proj'
-import proj4 from 'proj4'
-import { applyStyle } from 'ol-mapbox-style'
+import { crsQuad, quadGrid, quadLabel } from './crs'
+import { MapLibreView } from './MapLibreView'
+import { byRel, chooseStyleSource, discover, ensureProjection, loadMatrixSet } from './ogc'
+import { capabilitiesEntries, loadCapabilities, loadCswCatalog, planRaster } from './wmts'
+import type { ActiveLayer, ActiveRaster, AppliedStyle, Choice, Diagnostic, Engine, RasterEntry, ReportError, StyleDocument, Tileset, WorldCrs } from './types'
 import './App.css'
 
-type Link = { href: string; rel?: string; type?: string; title?: string; templated?: boolean }
-type Tileset = { id: string; title: string; description?: string; dataType?: string; crs?: string; tileMatrixSetId?: string; boundingBox?: { lowerLeft: number[]; upperRight: number[]; crs?: string }; links: Link[] }
-type TileMatrix = { id: string; scaleDenominator: number; cellSize?: number; pointOfOrigin: number[]; tileWidth: number; tileHeight: number; matrixWidth: number; matrixHeight: number }
-type MatrixSet = { id: string; title?: string; crs: string; tileMatrices: TileMatrix[] }
-type Diagnostic = { at: string; url: string; status: string; detail: string }
-type ActiveLayer = { key: string; tileset: Tileset; matrixSet: MatrixSet; tileUrl: string }
-type Choice = { tileUrl: string; matrixUrl: string }
-type GlStyle = Parameters<typeof applyStyle>[1]
-type AppliedStyle = { document: GlStyle; source: string; styleUrl?: string; layerCount: number; sourceLayers: string[] }
+type RasterMode = 'wmts' | 'csw'
 
 const storedKey = 'ogc-tiles-viewer-state'
-const absolute = (href: string, base: string) => new URL(href, base).toString().replace(/%7B/gi, '{').replace(/%7D/gi, '}')
-const byRel = (links: Link[], rels: string[]) => links.find((link) => rels.includes(link.rel ?? ''))
-const title = (value: Record<string, unknown>, fallback: string) => String(value.title ?? value.id ?? value.name ?? fallback)
+const storedEngineKey = 'ogc-tiles-viewer-engine'
+const storedCrsKey = 'ogc-tiles-viewer-crs'
+const storedRasterKey = 'ogc-tiles-viewer-raster'
+// OpenLayers is the alternative engine, so it is only downloaded when selected.
+const OpenLayersView = lazy(() => import('./OpenLayersView').then((module) => ({ default: module.OpenLayersView })))
 const hueFor = (key: string) => [...key].reduce((hue, character) => (hue * 31 + character.charCodeAt(0)) % 360, 7)
-
-function withTileFormat(template: string, format: string) {
-  const url = new URL(template)
-  url.searchParams.set('f', format)
-  return url.toString().replace(/%7B/gi, '{').replace(/%7D/gi, '}')
+const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
+const initialParams = new URLSearchParams(location.search)
+const readStored = (key: string) => { try { return localStorage.getItem(key) } catch { return null } }
+const initialEngine = (): Engine => ((initialParams.get('engine') ?? readStored(storedEngineKey)) === 'openlayers' ? 'openlayers' : 'maplibre')
+const initialCrs = (): WorldCrs => ((initialParams.get('crs') ?? readStored(storedCrsKey)) === 'WebMercatorQuad' ? 'WebMercatorQuad' : 'WorldCRS84Quad')
+const initialRaster = (): { mode: RasterMode; url: string } => {
+  const csw = initialParams.get('csw')
+  const wmts = initialParams.get('wmts')
+  if (csw) return { mode: 'csw', url: csw }
+  if (wmts) return { mode: 'wmts', url: wmts }
+  try { return { mode: 'wmts', url: '', ...JSON.parse(readStored(storedRasterKey) ?? '{}') } } catch { return { mode: 'wmts', url: '' } }
 }
-
-// A MapLibre document can declare several sources, but one OGC tileset backs one vector tile layer,
-// so the style layers of a single source are applied and the advertised tile template is kept.
-function chooseStyleSource(styleDocument: Record<string, unknown>): Omit<AppliedStyle, 'document' | 'styleUrl'> {
-  const sources = (styleDocument.sources as Record<string, Record<string, unknown>> | undefined) ?? {}
-  const styleLayers = (styleDocument.layers as Record<string, unknown>[] | undefined) ?? []
-  const ids = Object.keys(sources)
-  if (!ids.length) throw new Error('This document declares no sources, so it is not a MapLibre style.')
-  const vectorIds = ids.filter((id) => (sources[id]?.type ?? 'vector') === 'vector')
-  const ranked = (vectorIds.length ? vectorIds : ids)
-    .map((id) => ({ id, drawn: styleLayers.filter((styleLayer) => styleLayer.source === id) }))
-    .sort((a, b) => b.drawn.length - a.drawn.length)
-  const [best] = ranked
-  if (!best.drawn.length) throw new Error(`No style layer draws from \u201C${best.id}\u201D, so this style would render nothing.`)
-  const sourceLayers = [...new Set(best.drawn.map((styleLayer) => String(styleLayer['source-layer'] ?? '')).filter(Boolean))]
-  return { source: best.id, layerCount: best.drawn.length, sourceLayers }
-}
-
-async function getJson(url: string, diagnostics: Diagnostic[]) {
-  try {
-    const response = await fetch(url, { headers: { Accept: 'application/json' } })
-    const text = await response.text()
-    if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 500)}`)
-    return JSON.parse(text) as Record<string, unknown>
-  } catch (error) {
-    diagnostics.push({ at: new Date().toLocaleTimeString(), url, status: 'Request failed', detail: error instanceof Error ? error.message : String(error) })
-    throw error
-  }
-}
-
-function parseTileset(raw: Record<string, unknown>, base: string): Tileset {
-  const bbox = raw.boundingBox as Record<string, unknown> | undefined
-  return {
-    id: String(raw.id ?? raw.title ?? crypto.randomUUID()), title: title(raw, 'Untitled tileset'), description: typeof raw.description === 'string' ? raw.description : undefined,
-    dataType: typeof raw.dataType === 'string' ? raw.dataType : undefined, crs: typeof raw.crs === 'string' ? raw.crs : undefined, tileMatrixSetId: typeof raw.tileMatrixSetId === 'string' ? raw.tileMatrixSetId : undefined,
-    boundingBox: bbox ? { lowerLeft: (bbox.lowerLeft as number[]) ?? [], upperRight: (bbox.upperRight as number[]) ?? [], crs: typeof bbox.crs === 'string' ? bbox.crs : undefined } : undefined,
-    links: ((raw.links as Link[] | undefined) ?? []).map((link) => ({ ...link, href: absolute(link.href, base) })),
-  }
-}
-
-async function discover(endpoint: string, diagnostics: Diagnostic[]) {
-  const landing = await getJson(endpoint, diagnostics)
-  const links = (landing.links as Link[] | undefined) ?? []
-  const serviceDescription = byRel(links, ['service-desc'])
-  let tileFormats: string[] = []
-  if (serviceDescription) {
-    try {
-      const api = await getJson(absolute(serviceDescription.href, endpoint), diagnostics)
-      const parameters = ((api.components as Record<string, unknown> | undefined)?.parameters as Record<string, Record<string, unknown>> | undefined)
-      const tileFormat = parameters?.fTile
-      const schema = tileFormat?.schema as Record<string, unknown> | undefined
-      tileFormats = ((schema?.enum as unknown[] | undefined) ?? []).filter((format): format is string => typeof format === 'string')
-    } catch { /* discovery remains usable when the optional OpenAPI document cannot be read */ }
-  }
-  const tilesetsLink = byRel(links, ['http://www.opengis.net/def/rel/ogc/1.0/tilesets', 'tilesets', 'http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector', 'tilesets-vector'])
-  const collectionLinks = links.filter((link) => link.rel === 'item' || link.rel === 'collection')
-  const dataLink = byRel(links, ['data'])
-  const sets: Tileset[] = []
-  if (tilesetsLink) {
-    const catalogUrl = absolute(tilesetsLink.href, endpoint)
-    const catalog = await getJson(catalogUrl, diagnostics)
-    const rawSets = (catalog.tilesets as Record<string, unknown>[] | undefined) ?? []
-    sets.push(...rawSets.map((raw) => parseTileset(raw, catalogUrl)))
-  }
-  const collectionUrls = [...collectionLinks.map((link) => absolute(link.href, endpoint))]
-  if (dataLink) {
-    const collectionsUrl = absolute(dataLink.href, endpoint)
-    const collectionCatalog = await getJson(collectionsUrl, diagnostics)
-    for (const collection of (collectionCatalog.collections as Record<string, unknown>[] | undefined) ?? []) {
-      const self = byRel((collection.links as Link[] | undefined) ?? [], ['self'])
-      if (self) collectionUrls.push(absolute(self.href, collectionsUrl))
-    }
-  }
-  if (!sets.length && collectionUrls.length) {
-    for (const collectionUrl of collectionUrls) {
-      try {
-        const collection = await getJson(collectionUrl, diagnostics)
-        const collectionTiles = byRel((collection.links as Link[] | undefined) ?? [], ['http://www.opengis.net/def/rel/ogc/1.0/tilesets', 'tilesets', 'http://www.opengis.net/def/rel/ogc/1.0/tilesets-vector', 'tilesets-vector'])
-        if (collectionTiles) {
-          const tilesUrl = absolute(collectionTiles.href, collectionUrl)
-          const tileCatalog = await getJson(tilesUrl, diagnostics)
-          sets.push(...((tileCatalog.tilesets as Record<string, unknown>[] | undefined) ?? []).map((tile) => parseTileset(tile, tilesUrl)))
-        }
-      } catch { /* diagnostics records the failed collection request */ }
-    }
-  }
-  return sets.filter((set) => !set.dataType || set.dataType.toLowerCase() === 'vector').map((set) => {
-    if (!tileFormats.length) return set
-    return {
-      ...set,
-      links: set.links.flatMap((link) => link.rel === 'item' && link.templated
-        ? tileFormats.map((format) => ({ ...link, href: withTileFormat(link.href, format), type: link.type ?? `application/x-${format}`, title: format.toUpperCase() }))
-        : [link]),
-    }
-  })
-}
-
-async function loadMatrixSet(tileset: Tileset, matrixUrl: string | undefined, diagnostics: Diagnostic[]) {
-  let links = tileset.links
-  let inheritedCrs = tileset.crs
-  if (!matrixUrl) {
-    const self = byRel(links, ['self'])
-    if (self) {
-      const detail = await getJson(self.href, diagnostics)
-      links = ((detail.links as Link[] | undefined) ?? []).map((link) => ({ ...link, href: absolute(link.href, self.href) }))
-      inheritedCrs = typeof detail.crs === 'string' ? detail.crs : inheritedCrs
-    }
-  }
-  const link = matrixUrl ? { href: matrixUrl } : byRel(links, ['http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme', 'tiling-scheme', 'tileMatrixSet'])
-  if (!link) throw new Error('This tileset does not advertise a tile matrix set link.')
-  const raw = await getJson(link.href, diagnostics)
-  const matrices = (raw.tileMatrices as Record<string, unknown>[] | undefined) ?? []
-  return {
-    id: String(raw.id ?? link.title ?? 'Tile matrix set'), title: typeof raw.title === 'string' ? raw.title : link.title,
-    crs: String(raw.crs ?? inheritedCrs ?? ''),
-    tileMatrices: matrices.map((m) => ({ id: String(m.id), scaleDenominator: Number(m.scaleDenominator), cellSize: Number(m.cellSize), pointOfOrigin: m.pointOfOrigin as number[], tileWidth: Number(m.tileWidth), tileHeight: Number(m.tileHeight), matrixWidth: Number(m.matrixWidth), matrixHeight: Number(m.matrixHeight) })),
-  } satisfies MatrixSet
-}
-
-async function ensureProjection(crs: string, diagnostics: Diagnostic[]) {
-  if (getProjection(crs)) return
-  const code = crs.match(/(?:EPSG[:/]|::)(\d+)$/i)?.[1] ?? crs.match(/(\d+)$/)?.[1]
-  if (!code) throw new Error(`Cannot obtain a projection definition for “${crs}”.`)
-  const url = `https://epsg.io/${code}.proj4`
-  let response: Response
-  try { response = await fetch(url) } catch (error) { diagnostics.push({ at: new Date().toLocaleTimeString(), url, status: 'Projection request failed', detail: String(error) }); throw error }
-  if (!response.ok) throw new Error(`epsg.io could not provide a definition for EPSG:${code}.`)
-  proj4.defs(`EPSG:${code}`, await response.text())
-  register(proj4)
-  if (!getProjection(`EPSG:${code}`)) throw new Error(`OpenLayers could not register EPSG:${code}.`)
-  return `EPSG:${code}`
-}
+// Whether the MapLibre map can draw a raster in the given world CRS, natively or reprojected.
+const drawableIn = (raster: ActiveRaster, worldCrs: WorldCrs) => { try { planRaster(raster, worldCrs); return true } catch { return false } }
 
 function App() {
-  const mapElement = useRef<HTMLDivElement>(null)
-  const popupElement = useRef<HTMLDivElement>(null)
-  const mapRef = useRef<Map | null>(null)
-  const viewKeyRef = useRef('')
-  const [endpoint, setEndpoint] = useState(() => new URLSearchParams(location.search).get('endpoint') ?? localStorage.getItem(storedKey) ?? '')
+  const [endpoint, setEndpoint] = useState(() => initialParams.get('endpoint') ?? readStored(storedKey) ?? '')
+  const [engine, setEngine] = useState<Engine>(initialEngine)
+  const [worldCrs, setWorldCrs] = useState<WorldCrs>(initialCrs)
   const [tilesets, setTilesets] = useState<Tileset[]>([])
   const [active, setActive] = useState<ActiveLayer[]>([])
   const [choices, setChoices] = useState<Record<string, Choice>>({})
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([])
-  const [message, setMessage] = useState('Enter an OGC API Tiles landing-page URL to begin.')
+  const [message, setMessage] = useState('Enter an OGC API Tiles landing-page URL, or a WMTS or CSW URL, to begin.')
   const [loading, setLoading] = useState(false)
   const [metadata, setMetadata] = useState<Tileset | null>(null)
-  const [hits, setHits] = useState<Record<string, unknown>[]>([])
-  const [selectedHit, setSelectedHit] = useState(0)
   const [openMatrixSets, setOpenMatrixSets] = useState<Record<string, boolean>>({})
   const [styleInput, setStyleInput] = useState('')
   const [appliedStyle, setAppliedStyle] = useState<AppliedStyle | null>(null)
   const [showTileDebug, setShowTileDebug] = useState(true)
+  const [raster, setRaster] = useState(initialRaster)
+  const [apiKey, setApiKey] = useState('')
+  const [rasterCatalog, setRasterCatalog] = useState<RasterEntry[]>([])
+  const [rasterLoading, setRasterLoading] = useState(false)
+  const [rasters, setRasters] = useState<ActiveRaster[]>([])
+  const layerCount = active.length + rasters.length
   const groupedTilesets = tilesets.reduce<Record<string, Tileset[]>>((groups, set) => {
     const matrixSet = set.tileMatrixSetId ?? 'Unspecified tile matrix set'
     ;(groups[matrixSet] ??= []).push(set)
     return groups
   }, {})
 
-  useEffect(() => {
-    const map = new Map({ target: mapElement.current!, controls: defaultControls().extend([new ScaleLine({ units: 'metric' })]), view: new View({ center: [0, 0], zoom: 2 }) })
-    mapRef.current = map
-    const overlay = new Overlay({ element: popupElement.current!, autoPan: { animation: { duration: 150 } } })
-    map.addOverlay(overlay)
-    map.on('singleclick', (event) => {
-      const found: Record<string, unknown>[] = []
-      map.forEachFeatureAtPixel(event.pixel, (feature) => { found.push(feature.getProperties()); return undefined })
-      setHits(found); setSelectedHit(0); overlay.setPosition(found.length ? event.coordinate : undefined)
-    })
-    return () => map.setTarget(undefined)
+  const reportError = useCallback<ReportError>((diagnostic, nextMessage) => {
+    setDiagnostics((current) => [...current, { at: new Date().toLocaleTimeString(), ...diagnostic }])
+    if (nextMessage) setMessage(nextMessage)
   }, [])
 
   useEffect(() => {
-    localStorage.setItem(storedKey, endpoint)
+    try {
+      localStorage.setItem(storedKey, endpoint)
+      localStorage.setItem(storedEngineKey, engine)
+      localStorage.setItem(storedCrsKey, worldCrs)
+      localStorage.setItem(storedRasterKey, JSON.stringify(raster))
+    } catch { /* the viewer works without persisted state */ }
     const params = new URLSearchParams(location.search)
-    if (endpoint) params.set('endpoint', endpoint)
-    else params.delete('endpoint')
+    const set = (key: string, value: string | undefined) => { if (value) params.set(key, value); else params.delete(key) }
+    set('endpoint', endpoint)
+    set('engine', engine === 'maplibre' ? undefined : engine)
+    set('crs', engine === 'maplibre' && worldCrs !== 'WorldCRS84Quad' ? worldCrs : undefined)
+    set('wmts', raster.mode === 'wmts' ? raster.url : undefined)
+    set('csw', raster.mode === 'csw' ? raster.url : undefined)
     history.replaceState(null, '', `${location.pathname}?${params}`)
-  }, [endpoint])
+  }, [endpoint, engine, worldCrs, raster])
 
   async function submit(event: FormEvent) {
     event.preventDefault(); setLoading(true); setDiagnostics([]); setTilesets([]); setActive([])
@@ -228,7 +88,17 @@ function App() {
       const found = await discover(url, nextDiagnostics)
       setDiagnostics(nextDiagnostics); setTilesets(found)
       setMessage(found.length ? `Discovered ${found.length} vector tileset${found.length === 1 ? '' : 's'}. Choose a tile matrix set to add one.` : 'No usable vector tilesets were advertised by this API.')
-    } catch (error) { setDiagnostics((current) => [...current, { at: new Date().toLocaleTimeString(), url: endpoint, status: 'Discovery failed', detail: error instanceof Error ? error.message : String(error) }]); setMessage(`Discovery failed: ${error instanceof Error ? error.message : String(error)}`) } finally { setLoading(false) }
+    } catch (error) { reportError({ url: endpoint, status: 'Discovery failed', detail: describe(error) }, `Discovery failed: ${describe(error)}`) } finally { setLoading(false) }
+  }
+
+  // The MapLibre map works in one world CRS at a time; switching it drops the layers the new CRS cannot draw.
+  function switchWorldCrs(target: WorldCrs) {
+    const keptLayers = active.filter((layer) => typeof layer.grid !== 'string' && layer.grid.quad === target)
+    const keptRasters = rasters.filter((entry) => drawableIn(entry, target))
+    const dropped = active.length - keptLayers.length + rasters.length - keptRasters.length
+    if (dropped && !confirm(`Switch the map from ${worldCrs} to ${target}? ${dropped} layer${dropped === 1 ? '' : 's'} that cannot be drawn in ${target} will be removed.`)) return null
+    setWorldCrs(target)
+    return { keptLayers, keptRasters }
   }
 
   async function addLayer(tileset: Tileset) {
@@ -237,16 +107,80 @@ function App() {
       const choice = choices[tileset.id]
       const matrixSet = await loadMatrixSet(tileset, choice?.matrixUrl, nextDiagnostics)
       setDiagnostics(nextDiagnostics)
-      const projectionCode = (await ensureProjection(matrixSet.crs, nextDiagnostics)) ?? matrixSet.crs
-      const existingProjection = active[0]?.matrixSet.crs
-      if (existingProjection && existingProjection !== matrixSet.crs && !confirm(`Switch the map from ${existingProjection} to ${matrixSet.crs}? Active layers will be removed.`)) return
+      const grid = quadGrid(matrixSet.crs, matrixSet.tileMatrices.map((matrix) => ({ id: matrix.id, matrixWidth: matrix.matrixWidth, matrixHeight: matrix.matrixHeight, tileWidth: matrix.tileWidth, tileHeight: matrix.tileHeight, origin: matrix.pointOfOrigin })))
       const tileLink = choice ? { href: choice.tileUrl } : byRel(tileset.links, ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'])
       if (!tileLink) throw new Error('This tileset does not advertise a tile URL template.')
       const key = `${tileset.id}:${matrixSet.id}`
-      const next: ActiveLayer = { key, tileset, matrixSet: { ...matrixSet, crs: projectionCode }, tileUrl: tileLink.href }
-      const replacing = existingProjection && existingProjection !== matrixSet.crs
+      if (engine === 'maplibre') {
+        if (typeof grid === 'string') throw new Error(`MapLibre draws WorldCRS84Quad and WebMercatorQuad tile matrix sets only. ${grid} Switch the engine to OpenLayers to draw it.`)
+        // OpenLayers knows EPSG:4326 and EPSG:3857 under every name, so the layer stays usable after an engine switch.
+        const projectionCode = (await ensureProjection(matrixSet.crs, nextDiagnostics).catch(() => undefined)) ?? matrixSet.crs
+        const next: ActiveLayer = { key, tileset, matrixSet: { ...matrixSet, crs: projectionCode }, tileUrl: tileLink.href, grid }
+        const kept = grid.quad === worldCrs ? { keptLayers: active, keptRasters: rasters } : switchWorldCrs(grid.quad)
+        if (!kept) return
+        setRasters(kept.keptRasters)
+        setActive([...kept.keptLayers.filter((layer) => layer.key !== key), next])
+        return
+      }
+      const projectionCode = (await ensureProjection(matrixSet.crs, nextDiagnostics)) ?? matrixSet.crs
+      const existingProjection = active[0]?.matrixSet.crs
+      if (existingProjection && existingProjection !== projectionCode && !confirm(`Switch the map from ${existingProjection} to ${matrixSet.crs}? Active layers will be removed.`)) return
+      const next: ActiveLayer = { key, tileset, matrixSet: { ...matrixSet, crs: projectionCode }, tileUrl: tileLink.href, grid }
+      const replacing = existingProjection && existingProjection !== projectionCode
       setActive((previous) => replacing ? [next] : [...previous.filter((layer) => layer.key !== key), next])
-    } catch (error) { setDiagnostics(nextDiagnostics); setMessage(`Could not add ${tileset.title}: ${error instanceof Error ? error.message : String(error)}`) }
+    } catch (error) { setDiagnostics(nextDiagnostics); setMessage(`Could not add ${tileset.title}: ${describe(error)}`) }
+  }
+
+  async function loadRasterCatalog(event: FormEvent) {
+    event.preventDefault(); setRasterLoading(true); setRasterCatalog([])
+    const nextDiagnostics: Diagnostic[] = []
+    try {
+      const url = new URL(raster.url).toString()
+      const entries = raster.mode === 'csw' ? await loadCswCatalog(url, apiKey, nextDiagnostics) : capabilitiesEntries(await loadCapabilities(url, apiKey, nextDiagnostics), url)
+      setRasterCatalog(entries)
+      setMessage(entries.length ? `Found ${entries.length} raster layer${entries.length === 1 ? '' : 's'}. Select + to add one.` : `The ${raster.mode === 'csw' ? 'CSW catalog' : 'WMTS service'} lists no raster layers.`)
+    } catch (error) { setMessage(`Could not load the ${raster.mode === 'csw' ? 'CSW catalog' : 'WMTS capabilities'}: ${describe(error)}`) } finally {
+      setDiagnostics((current) => [...current, ...nextDiagnostics]); setRasterLoading(false)
+    }
+  }
+
+  async function addRaster(entry: RasterEntry) {
+    const nextDiagnostics: Diagnostic[] = []
+    try {
+      const capabilities = await loadCapabilities(entry.capabilitiesUrl, apiKey, nextDiagnostics)
+      const next: ActiveRaster = { key: `raster:${entry.capabilitiesUrl}#${entry.wmtsLayerId}`, title: entry.title, capabilities, wmtsLayerId: entry.wmtsLayerId, apiKey }
+      let kept = { keptLayers: active, keptRasters: rasters }
+      let note = ''
+      if (engine === 'maplibre') {
+        let crs = worldCrs
+        if (!drawableIn(next, worldCrs)) {
+          // A raster with only a Web Mercator grid cannot be drawn on a WorldCRS84Quad map; planRaster explains why otherwise.
+          crs = worldCrs === 'WorldCRS84Quad' ? 'WebMercatorQuad' : 'WorldCRS84Quad'
+          planRaster(next, crs)
+          const switched = switchWorldCrs(crs)
+          if (!switched) return
+          kept = switched
+        }
+        if (planRaster(next, crs).reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser${apiKey ? '; the reprojection plugin fetches them without the x-api-key header' : ''}.`
+      }
+      setActive(kept.keptLayers)
+      setRasters([...kept.keptRasters.filter((item) => item.key !== next.key), next])
+      setMessage(`Added ${entry.title}.${note}`)
+    } catch (error) { setMessage(`Could not add ${entry.title}: ${describe(error)}`) } finally { setDiagnostics((current) => [...current, ...nextDiagnostics]) }
+  }
+
+  function changeEngine(next: Engine) {
+    if (next === engine) return
+    if (next === 'maplibre') {
+      const drawable = active.flatMap((layer) => (typeof layer.grid === 'string' ? [] : [{ layer, quad: layer.grid.quad }]))
+      const quad = drawable[0]?.quad ?? worldCrs
+      const keptLayers = drawable.filter((entry) => entry.quad === quad).map((entry) => entry.layer)
+      const keptRasters = rasters.filter((entry) => drawableIn(entry, quad))
+      const dropped = active.length - keptLayers.length + rasters.length - keptRasters.length
+      if (dropped && !confirm(`MapLibre draws one of WorldCRS84Quad or WebMercatorQuad at a time. Remove the ${dropped} layer${dropped === 1 ? '' : 's'} it cannot draw in ${quad}?`)) return
+      setWorldCrs(quad); setActive(keptLayers); setRasters(keptRasters)
+    }
+    setEngine(next)
   }
 
   async function loadStyle() {
@@ -257,85 +191,51 @@ function App() {
       return
     }
     try {
-      let styleDocument: Record<string, unknown>
+      let styleDocument: StyleDocument
       let styleUrl: string | undefined
-      if (value.startsWith('{')) styleDocument = JSON.parse(value) as Record<string, unknown>
+      if (value.startsWith('{')) styleDocument = JSON.parse(value) as StyleDocument
       else {
         styleUrl = new URL(value).toString()
         const response = await fetch(styleUrl)
         if (!response.ok) throw new Error(`${response.status} ${response.statusText}`)
-        styleDocument = (await response.json()) as Record<string, unknown>
+        styleDocument = (await response.json()) as StyleDocument
       }
       const chosen = chooseStyleSource(styleDocument)
-      setAppliedStyle({ document: styleDocument as GlStyle, styleUrl, ...chosen })
-      const drawn = `${chosen.layerCount} style layer${chosen.layerCount === 1 ? '' : 's'} from source \u201C${chosen.source}\u201D`
+      setAppliedStyle({ document: styleDocument, styleUrl, ...chosen })
+      const drawn = `${chosen.layerCount} style layer${chosen.layerCount === 1 ? '' : 's'} from source “${chosen.source}”`
       const expects = chosen.sourceLayers.length ? ` It draws source-layers ${chosen.sourceLayers.slice(0, 8).join(', ')}; a tileset without them renders empty.` : ''
       setMessage(active.length ? `Applied ${drawn}.${expects}` : `Loaded ${drawn}. Add a tileset to draw it.`)
-    } catch (error) { setMessage(`Could not load style: ${error instanceof Error ? error.message : String(error)}`) }
+    } catch (error) { setMessage(`Could not load style: ${describe(error)}`) }
   }
 
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !active.length) return
-    const projection = getProjection(active[0].matrixSet.crs)
-    if (!projection) return
-    let stale = false
-    const box = active[0].tileset.boundingBox
-    const viewKey = `${active[0].matrixSet.crs}|${active.map((layer) => layer.key).join(',')}`
-    if (viewKeyRef.current !== viewKey) {
-      viewKeyRef.current = viewKey
-      map.setView(new View({ projection, center: box?.lowerLeft ?? [0, 0], zoom: 0 }))
-      if (box?.lowerLeft.length === 2 && box.upperRight.length === 2 && (!box.crs || box.crs === active[0].matrixSet.crs)) map.getView().fit([...box.lowerLeft, ...box.upperRight], { padding: [50, 50, 50, 330], duration: 300 })
-    }
-    map.getLayers().clear()
-    for (const layer of active) {
-      const matrices = layer.matrixSet.tileMatrices
-      const meters = projection.getMetersPerUnit() ?? 1
-      const grid = new TileGrid({ extent: layer.tileset.boundingBox && (!layer.tileset.boundingBox.crs || layer.tileset.boundingBox.crs === layer.matrixSet.crs) ? [...layer.tileset.boundingBox.lowerLeft, ...layer.tileset.boundingBox.upperRight] : undefined, origins: matrices.map((m) => m.pointOfOrigin), resolutions: matrices.map((m) => m.cellSize || m.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((m) => [m.tileWidth, m.tileHeight]) })
-      const source = new VectorTileSource({ format: new MVT(), projection, tileGrid: grid, tileUrlFunction: ([z, x, y]) => layer.tileUrl.replace(/\{tileMatrix\}/gi, matrices[z].id).replace(/\{tileCol\}/gi, String(x)).replace(/\{tileRow\}/gi, String(y)) })
-      const tileUrlFunction = source.getTileUrlFunction()
-      const vectorLayer = new VectorTileLayer({ source, declutter: Boolean(appliedStyle) })
-      const hue = hueFor(layer.key)
-      vectorLayer.setStyle((feature) => {
-        const geometry = feature.getGeometry()?.getType()
-        const color = `hsl(${hue}, 68%, 54%)`
-        if (geometry?.includes('Point')) return new Style({ image: new CircleStyle({ radius: 5, fill: new Fill({ color }), stroke: new Stroke({ color: '#1a1e1b', width: 1 }) }) })
-        if (geometry?.includes('Line')) return new Style({ stroke: new Stroke({ color, width: 2 }) })
-        return new Style({ fill: new Fill({ color: `hsla(${hue}, 68%, 54%, .55)` }), stroke: new Stroke({ color, width: 1 }) })
-      })
-      if (appliedStyle) {
-        const options = { source: appliedStyle.source, updateSource: false, ...(appliedStyle.styleUrl ? { styleUrl: appliedStyle.styleUrl } : {}) }
-        void applyStyle(vectorLayer, appliedStyle.document, options).then(() => {
-          if (stale) return
-          // The advertised OGC template stays authoritative, so a MapLibre source definition never replaces it.
-          if (vectorLayer.getSource() !== source) vectorLayer.setSource(source)
-          if (source.getTileUrlFunction() !== tileUrlFunction) source.setTileUrlFunction(tileUrlFunction)
-        }).catch((error: unknown) => {
-          if (stale) return
-          const detail = error instanceof Error ? error.message : String(error)
-          setDiagnostics((current) => [...current, { at: new Date().toLocaleTimeString(), url: appliedStyle.styleUrl ?? 'pasted style document', status: 'Style could not be applied', detail }])
-          setMessage(`Could not apply the style to ${layer.tileset.title}: ${detail}`)
-        })
-      }
-      map.addLayer(vectorLayer)
-    }
-    if (showTileDebug) {
-      const matrices = active[0].matrixSet.tileMatrices
-      const meters = projection.getMetersPerUnit() ?? 1
-      const grid = new TileGrid({ origins: matrices.map((matrix) => matrix.pointOfOrigin), resolutions: matrices.map((matrix) => matrix.cellSize || matrix.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((matrix) => [matrix.tileWidth, matrix.tileHeight]) })
-      map.addLayer(new TileLayer({ source: new TileDebug({ projection, tileGrid: grid }) }))
-    }
-    return () => { stale = true }
-  }, [active, appliedStyle, showTileDebug])
-
+  const viewProps = { layers: active, rasters, appliedStyle, showTileDebug, hueFor, onError: reportError }
   return <main className="app">
-    <header><div className="brand"><span>OGC</span> TILES / VECTOR WORKBENCH</div><div className="status"><i /> {active.length ? `${active.length} ACTIVE LAYER${active.length > 1 ? 'S' : ''}` : 'NO LAYERS ACTIVE'}</div></header>
-    <aside className="sidebar"><form onSubmit={submit}><label htmlFor="endpoint">API LANDING PAGE</label><div className="endpoint"><input id="endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://example.org/ogc" /><button disabled={loading}>{loading ? '...' : 'DISCOVER'}</button></div></form>
-      <p className="message">{message}</p><section><h2>STYLE {appliedStyle && <b>{appliedStyle.layerCount}</b>}</h2><div className="endpoint style"><textarea aria-label="MapLibre style URL or document" value={styleInput} onChange={(event) => setStyleInput(event.target.value)} placeholder="MapLibre style URL, or paste a style JSON document" spellCheck={false} /><button type="button" onClick={() => void loadStyle()}>APPLY</button></div><small>{appliedStyle ? `Drawing source \u201C${appliedStyle.source}\u201D. Empty the field and select APPLY for the generated style.` : 'Blank uses a generated style colored by geometry type.'}</small></section><label className="debug-toggle"><input type="checkbox" checked={showTileDebug} onChange={(event) => setShowTileDebug(event.target.checked)} /> SHOW Z/X/Y TILE GRID</label><section><h2>CATALOG <b>{tilesets.length}</b></h2>{Object.entries(groupedTilesets).sort(([a], [b]) => a.localeCompare(b)).map(([matrixSet, entries]) => <details className="matrix-group" key={matrixSet} open={openMatrixSets[matrixSet] ?? true} onToggle={(event) => { const isOpen = event.currentTarget.open; setOpenMatrixSets((current) => ({ ...current, [matrixSet]: isOpen })) }}><summary>{matrixSet} <b>{entries.length}</b></summary>{entries.map((set) => { const tileLinks = set.links.filter((link) => ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'].includes(link.rel ?? '')); const matrixLinks = set.links.filter((link) => ['http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme', 'tiling-scheme', 'tileMatrixSet'].includes(link.rel ?? '')); const choice = choices[set.id]; return <article className="tileset catalog-item" key={set.id}><div><strong>{set.title}</strong><small>{set.dataType ?? 'vector'} · {set.crs ?? 'CRS from matrix set'}</small>{tileLinks.length > 0 && <select aria-label={`Tile format for ${set.title}`} value={choice?.tileUrl ?? tileLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: e.target.value, matrixUrl: choice?.matrixUrl ?? matrixLinks[0]?.href ?? '' } }))}>{tileLinks.map((link) => <option key={link.href} value={link.href}>{link.title ? `${link.title} (${link.type ?? 'format unspecified'})` : link.type ?? 'Format unspecified'}</option>)}</select>}{matrixLinks.length > 1 && <select value={choice?.matrixUrl ?? matrixLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: choice?.tileUrl ?? tileLinks[0]?.href ?? '', matrixUrl: e.target.value } }))}>{matrixLinks.map((link) => <option key={link.href} value={link.href}>{link.title ?? link.href}</option>)}</select>}</div><button className="info" onClick={() => setMetadata(set)}>i</button><button className="add" onClick={() => void addLayer(set)} aria-label={`Add ${set.title}`}>+</button></article> })}</details>)}</section>
-      <section><h2>LAYERS <b>{active.length}</b></h2>{active.map((layer) => <article className="tileset active" key={layer.key}><div><strong>{layer.tileset.title}</strong><small>{layer.matrixSet.id} · {layer.matrixSet.crs}</small></div><button className="remove" onClick={() => setActive((layers) => layers.filter((item) => item.key !== layer.key))}>REMOVE</button></article>)}</section>
+    <header><div className="brand"><span>OGC</span> TILES / VECTOR + RASTER WORKBENCH</div><div className="status"><i /> {layerCount ? `${layerCount} ACTIVE LAYER${layerCount > 1 ? 'S' : ''}` : 'NO LAYERS ACTIVE'}</div></header>
+    <aside className="sidebar">
+      <section className="map-settings"><h2>MAP</h2>
+        <div className="segmented" role="radiogroup" aria-label="Map engine">{(['maplibre', 'openlayers'] as const).map((option) => <button type="button" key={option} role="radio" aria-checked={engine === option} className={engine === option ? 'selected' : ''} onClick={() => changeEngine(option)}>{option === 'maplibre' ? 'MAPLIBRE' : 'OPENLAYERS'}</button>)}</div>
+        {engine === 'maplibre'
+          ? <><div className="segmented" role="radiogroup" aria-label="Map CRS">{(['WorldCRS84Quad', 'WebMercatorQuad'] as const).map((option) => <button type="button" key={option} role="radio" aria-checked={worldCrs === option} className={worldCrs === option ? 'selected' : ''} onClick={() => { const kept = option !== worldCrs && switchWorldCrs(option); if (kept) { setActive(kept.keptLayers); setRasters(kept.keptRasters) } }}>{quadLabel[option]}</button>)}</div>
+            <small>{worldCrs === 'WorldCRS84Quad' ? 'Tiles are requested and drawn natively in EPSG:4326.' : 'EPSG:4326 rasters are reprojected to Web Mercator in the browser.'}</small></>
+          : <small>OpenLayers follows the first layer&apos;s advertised CRS and grid, for any EPSG code.</small>}
+      </section>
+      <form onSubmit={submit}><label htmlFor="endpoint">API LANDING PAGE</label><div className="endpoint"><input id="endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://example.org/ogc" /><button disabled={loading}>{loading ? '...' : 'DISCOVER'}</button></div></form>
+      <p className="message">{message}</p><section><h2>STYLE {appliedStyle && <b>{appliedStyle.layerCount}</b>}</h2><div className="endpoint style"><textarea aria-label="MapLibre style URL or document" value={styleInput} onChange={(event) => setStyleInput(event.target.value)} placeholder="MapLibre style URL, or paste a style JSON document" spellCheck={false} /><button type="button" onClick={() => void loadStyle()}>APPLY</button></div><small>{appliedStyle ? `Drawing source “${appliedStyle.source}”. Empty the field and select APPLY for the generated style.` : 'Blank uses a generated style colored by geometry type.'}</small></section><label className="debug-toggle"><input type="checkbox" checked={showTileDebug} onChange={(event) => setShowTileDebug(event.target.checked)} /> SHOW Z/X/Y TILE GRID</label><section><h2>CATALOG <b>{tilesets.length}</b></h2>{Object.entries(groupedTilesets).sort(([a], [b]) => a.localeCompare(b)).map(([matrixSet, entries]) => <details className="matrix-group" key={matrixSet} open={openMatrixSets[matrixSet] ?? true} onToggle={(event) => { const isOpen = event.currentTarget.open; setOpenMatrixSets((current) => ({ ...current, [matrixSet]: isOpen })) }}><summary>{matrixSet} <b>{entries.length}</b></summary>{entries.map((set) => { const tileLinks = set.links.filter((link) => ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'].includes(link.rel ?? '')); const matrixLinks = set.links.filter((link) => ['http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme', 'tiling-scheme', 'tileMatrixSet'].includes(link.rel ?? '')); const choice = choices[set.id]; return <article className="tileset catalog-item" key={set.id}><div><strong>{set.title}</strong><small>{set.dataType ?? 'vector'} · {set.crs ?? 'CRS from matrix set'}</small>{tileLinks.length > 0 && <select aria-label={`Tile format for ${set.title}`} value={choice?.tileUrl ?? tileLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: e.target.value, matrixUrl: choice?.matrixUrl ?? matrixLinks[0]?.href ?? '' } }))}>{tileLinks.map((link) => <option key={link.href} value={link.href}>{link.title ? `${link.title} (${link.type ?? 'format unspecified'})` : link.type ?? 'Format unspecified'}</option>)}</select>}{matrixLinks.length > 1 && <select value={choice?.matrixUrl ?? matrixLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: choice?.tileUrl ?? tileLinks[0]?.href ?? '', matrixUrl: e.target.value } }))}>{matrixLinks.map((link) => <option key={link.href} value={link.href}>{link.title ?? link.href}</option>)}</select>}</div><button className="info" onClick={() => setMetadata(set)}>i</button><button className="add" onClick={() => void addLayer(set)} aria-label={`Add ${set.title}`}>+</button></article> })}</details>)}</section>
+      <section><h2>RASTER <b>{rasterCatalog.length}</b></h2>
+        <form onSubmit={loadRasterCatalog}>
+          <div className="segmented" role="radiogroup" aria-label="Raster catalog type">{([['wmts', 'WMTS CAPABILITIES'], ['csw', 'MAPCOLONIES CSW']] as const).map(([mode, label]) => <button type="button" key={mode} role="radio" aria-checked={raster.mode === mode} className={raster.mode === mode ? 'selected' : ''} onClick={() => { setRaster((current) => ({ ...current, mode })); setRasterCatalog([]) }}>{label}</button>)}</div>
+          <div className="endpoint"><input aria-label={raster.mode === 'csw' ? 'CSW URL' : 'WMTS capabilities URL'} value={raster.url} onChange={(e) => setRaster((current) => ({ ...current, url: e.target.value }))} placeholder={raster.mode === 'csw' ? 'https://example.org/raster-catalog/csw' : 'https://example.org/wmts/1.0.0/WMTSCapabilities.xml'} /><button disabled={rasterLoading}>{rasterLoading ? '...' : 'LOAD'}</button></div>
+          <div className="endpoint"><input type="password" aria-label="API key" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Optional x-api-key" /></div>
+        </form>
+        {rasterCatalog.map((entry) => <article className="tileset catalog-item" key={`${entry.capabilitiesUrl}#${entry.id}`}><div><strong>{entry.title}</strong><small>{entry.matrixSets.length ? entry.matrixSets.join(', ') : entry.wmtsLayerId}</small></div><button className="add" onClick={() => void addRaster(entry)} aria-label={`Add ${entry.title}`}>+</button></article>)}
+      </section>
+      <section><h2>LAYERS <b>{layerCount}</b></h2>
+        {active.map((layer) => <article className="tileset active" key={layer.key}><div><strong>{layer.tileset.title}</strong><small>{layer.matrixSet.id} · {layer.matrixSet.crs}</small></div><button className="remove" onClick={() => setActive((layers) => layers.filter((item) => item.key !== layer.key))}>REMOVE</button></article>)}
+        {rasters.map((entry) => <article className="tileset active raster" key={entry.key}><div><strong>{entry.title}</strong><small>raster · WMTS {entry.wmtsLayerId}</small></div><button className="remove" onClick={() => setRasters((items) => items.filter((item) => item.key !== entry.key))}>REMOVE</button></article>)}
+      </section>
       <details><summary>DEVELOPER DIAGNOSTICS <b>{diagnostics.length}</b></summary>{diagnostics.length ? diagnostics.map((d, i) => <pre key={i}>{d.at} {d.status}\n{d.url}\n{d.detail}</pre>) : <p>No request failures recorded.</p>}</details></aside>
-    <div className="map-wrap"><div ref={mapElement} className={appliedStyle ? 'map styled' : 'map'} /><div className="map-caption">{active[0]?.matrixSet.crs ?? 'NO ACTIVE CRS'}</div><div ref={popupElement} className="popup">{hits.length > 0 && <><header><strong>{hits.length} FEATURE{hits.length > 1 ? 'S' : ''}</strong><select value={selectedHit} onChange={(e) => setSelectedHit(Number(e.target.value))}>{hits.map((_, i) => <option key={i} value={i}>Feature {i + 1}</option>)}</select></header><pre>{JSON.stringify(hits[selectedHit], null, 2)}</pre></>}</div></div>
-    {metadata && <div className="modal-backdrop" onClick={() => setMetadata(null)}><section className="modal" onClick={(e) => e.stopPropagation()}><button onClick={() => setMetadata(null)}>CLOSE</button><h2>{metadata.title}</h2><p>{metadata.description ?? 'No description advertised.'}</p><dl><dt>CRS</dt><dd>{metadata.crs ?? 'Advertised by selected tile matrix set'}</dd><dt>EXTENT</dt><dd>{metadata.boundingBox ? `${metadata.boundingBox.lowerLeft.join(', ')} / ${metadata.boundingBox.upperRight.join(', ')}` : 'Not advertised'}</dd><dt>LINKS</dt><dd>{metadata.links.map((link) => `${link.rel ?? 'link'}: ${link.title ?? link.href}`).join('\n')}</dd></dl></section></div>}
+    <div className="map-wrap">{engine === 'maplibre' ? <MapLibreView key={worldCrs} worldCrs={worldCrs} {...viewProps} /> : <Suspense fallback={<div className="map" />}><OpenLayersView {...viewProps} /></Suspense>}</div>
+    {metadata && <div className="modal-backdrop" onClick={() => setMetadata(null)}><section className="modal" onClick={(e) => e.stopPropagation()}><button onClick={() => setMetadata(null)}>CLOSE</button><h2>{metadata.title}</h2><p>{metadata.description ?? 'No description advertised.'}</p><dl><dt>CRS</dt><dd>{metadata.crs ?? 'Advertised by selected tile matrix set'}{engine === 'maplibre' && metadata.crs && !crsQuad(metadata.crs) ? ' (not drawable by MapLibre; switch to OpenLayers)' : ''}</dd><dt>EXTENT</dt><dd>{metadata.boundingBox ? `${metadata.boundingBox.lowerLeft.join(', ')} / ${metadata.boundingBox.upperRight.join(', ')}` : 'Not advertised'}</dd><dt>LINKS</dt><dd>{metadata.links.map((link) => `${link.rel ?? 'link'}: ${link.title ?? link.href}`).join('\n')}</dd></dl></section></div>}
   </main>
 }
 
