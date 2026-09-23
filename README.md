@@ -8,7 +8,7 @@ The viewer does not need a backend or proxy. It follows links advertised by an O
 
 ## Features
 
-- Draw with MapLibre in `WorldCRS84Quad` (EPSG:4326) by default, or switch the map to `WebMercatorQuad` (EPSG:3857).
+- Draw with MapLibre in `WorldCRS84Quad` (EPSG:4326) or `WebMercatorQuad` (EPSG:3857), chosen by the layers or pinned.
 - Switch to OpenLayers to draw a tileset in any CRS and tile matrix set.
 - Load WMTS raster layers from a WMTS GetCapabilities URL, or from a MapColonies CSW raster catalog.
 - Reproject EPSG:4326 WMTS rasters to Web Mercator in the browser with [`@nivgreen/maplibre-gl-raster-reprojection`](https://www.npmjs.com/package/@nivgreen/maplibre-gl-raster-reprojection).
@@ -18,7 +18,7 @@ The viewer does not need a backend or proxy. It follows links advertised by an O
 - Select an advertised tile representation, including MVT, PBF, or another advertised media type.
 - Render vector tiles using their advertised tile matrix set, origin, resolutions, tile size, and CRS.
 - Never assume Web Mercator. Missing EPSG definitions are requested from `epsg.io` and registered with `proj4`.
-- Prompt before switching to a tileset with a different map CRS; accepting clears incompatible active layers.
+- Pick the map CRS automatically from the layers you add, and keep the current view when layers are added or the CRS or engine changes.
 - Inspect all vector features hit by a map click and view their raw properties.
 - Show metadata, request diagnostics, scale, CRS, and a tile debug grid.
 - Apply a MapLibre style, pasted or fetched from a URL, without replacing the discovered OGC source.
@@ -74,16 +74,18 @@ The viewer deliberately does not infer a `/tiles` route from a landing page.
 
 The **MAP** section selects the engine. The choice is kept in the `engine` query parameter when it is not the default.
 
-**MAPLIBRE** is the default. It works in one of the two tile matrix sets the MapLibre fork supports, chosen under the engine:
+**MAPLIBRE** is the default. It works in one of the two tile matrix sets the MapLibre fork supports: **WorldCRS84Quad** (EPSG:4326, plate carrée, no reprojection) or **WebMercatorQuad** (EPSG:3857). The map CRS control under the engine offers:
 
-- **WorldCRS84Quad · EPSG:4326**, the default. Tiles are requested in EPSG:4326 and drawn in plate carrée with no reprojection.
-- **WebMercatorQuad · EPSG:3857**. Kept in the `crs` query parameter.
+- **AUTO**, the default: the layers choose. The layer you add is drawn in its own grid when every layer already on the map can follow it there. When some cannot, the map stays in its current CRS if it can still draw the new layer (reprojecting an EPSG:4326 raster to Web Mercator), and asks before removing layers only when it cannot. Removing a layer returns the map to the remaining layers' own grid when they can all be drawn there.
+- **EPSG:4326** or **EPSG:3857** pins the map CRS; an EPSG:4326 raster added to a pinned Web Mercator map is reprojected. A pinned map changes CRS only when a layer cannot be drawn in it at all, after asking. The pinned choice is kept in the `crs` query parameter.
 
-The fork's world CRS is a process-wide setting, so changing it recreates the map. A vector tileset is drawn natively when its tile matrix set is one of those two grids, recognised from its CRS, the shape of each tile matrix, and its origin rather than from its identifier. The tile matrix identifiers must be the level number, optionally behind a fixed prefix such as `EPSG:4326:`. Adding a tileset in the other grid asks before switching the map and removing the layers the new grid cannot draw. A tileset in any other grid is refused with a hint to switch engines.
+The fork's world CRS is a process-wide setting, so changing it recreates the map, which reopens at the same place and zoom. A vector tileset is drawn natively when its tile matrix set is one of those two grids, recognised from its CRS, the shape, pixel size and origin of each tile matrix rather than from its identifier. The tile matrix identifiers must be the level number, optionally behind a fixed prefix such as `EPSG:4326:`. A tileset in any other grid is refused with a hint to switch engines.
 
 MapLibre only draws a vector `source-layer` that a style layer names. Every OGC vector tile is fetched through a custom protocol that reads the layer names inside it, so the generated style grows as tiles arrive.
 
 **OPENLAYERS** follows the first layer's advertised CRS and tile matrix set for any EPSG code, as described under [CRS Behavior](#crs-behavior). Switching back to MapLibre keeps the layers it can draw and asks before removing the rest.
+
+In both engines the map zooms to the first layer added to an empty map. Adding further layers, switching the CRS, or switching the engine keeps the current view.
 
 ## Raster (WMTS And CSW)
 
@@ -98,9 +100,10 @@ A layer's tile URL comes from its RESTful `ResourceURL` template, or from the KV
 
 Our WMTS raster provider serves EPSG:4326 `WorldCRS84Quad` tiles only:
 
+- In AUTO, a map with no layers that cannot follow switches to WorldCRS84Quad for them, so the tiles are drawn natively.
 - On a **WorldCRS84Quad** map the tiles are drawn natively.
 - On a **WebMercatorQuad** map a layer's EPSG:3857 matrix set is used when it has one. Otherwise its EPSG:4326 tiles are reprojected in the browser by [`@nivgreen/maplibre-gl-raster-reprojection`](https://github.com/NivGreenstein/maplibre-gl-raster-reprojection), which requests the level below each mercator tile. The plugin fetches source tiles itself and does not send the `x-api-key` header, so a raster behind an API-key header draws only on a WorldCRS84Quad map.
-- A raster with only an EPSG:3857 matrix set cannot be drawn on a WorldCRS84Quad map, so adding one asks before switching the map to WebMercatorQuad.
+- A raster with only an EPSG:3857 matrix set cannot be drawn on a WorldCRS84Quad map. In AUTO the map switches for it when no layer is lost, and otherwise asks.
 - A matrix set is only drawn by MapLibre when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. NASA GIBS' EPSG:4326 sets, for example, use 512 px tiles that span 288 degrees at level 0, so MapLibre refuses them and OpenLayers draws them.
 
 OpenLayers draws WMTS rasters with `ol/source/WMTS`, preferring a matrix set in the map's projection and otherwise reprojecting.

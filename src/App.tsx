@@ -8,6 +8,8 @@ import type { ActiveLayer, ActiveRaster, AppliedStyle, Choice, Diagnostic, Engin
 import './App.css'
 
 type RasterMode = 'wmts' | 'csw'
+// AUTO lets the layers choose the MapLibre world CRS; the others pin it.
+type CrsMode = 'auto' | WorldCrs
 
 const storedKey = 'ogc-tiles-viewer-state'
 const storedEngineKey = 'ogc-tiles-viewer-engine'
@@ -20,7 +22,9 @@ const describe = (error: unknown) => (error instanceof Error ? error.message : S
 const initialParams = new URLSearchParams(location.search)
 const readStored = (key: string) => { try { return localStorage.getItem(key) } catch { return null } }
 const initialEngine = (): Engine => ((initialParams.get('engine') ?? readStored(storedEngineKey)) === 'openlayers' ? 'openlayers' : 'maplibre')
-const initialCrs = (): WorldCrs => ((initialParams.get('crs') ?? readStored(storedCrsKey)) === 'WebMercatorQuad' ? 'WebMercatorQuad' : 'WorldCRS84Quad')
+const crsModes = ['auto', 'WorldCRS84Quad', 'WebMercatorQuad'] as const
+const crsModeLabel: Record<CrsMode, string> = { auto: 'AUTO', WorldCRS84Quad: 'EPSG:4326', WebMercatorQuad: 'EPSG:3857' }
+const initialCrsMode = (): CrsMode => crsModes.find((mode) => mode === (initialParams.get('crs') ?? readStored(storedCrsKey))) ?? 'auto'
 const initialRaster = (): { mode: RasterMode; url: string } => {
   const csw = initialParams.get('csw')
   const wmts = initialParams.get('wmts')
@@ -30,11 +34,27 @@ const initialRaster = (): { mode: RasterMode; url: string } => {
 }
 // Whether the MapLibre map can draw a raster in the given world CRS, natively or reprojected.
 const drawableIn = (raster: ActiveRaster, worldCrs: WorldCrs) => { try { planRaster(raster, worldCrs); return true } catch { return false } }
+const otherCrs = (crs: WorldCrs): WorldCrs => (crs === 'WorldCRS84Quad' ? 'WebMercatorQuad' : 'WorldCRS84Quad')
+const vectorFits = (layer: ActiveLayer, crs: WorldCrs) => typeof layer.grid !== 'string' && layer.grid.quad === crs
+// The world CRS a raster is drawn in without reprojection, preferring the current one when it has both grids.
+const rasterNative = (raster: ActiveRaster, current: WorldCrs) => { try { if (!planRaster(raster, current).reprojected) return current } catch { /* not drawable in the current CRS */ } return otherCrs(current) }
+// In AUTO, the first vector layer chooses the CRS, since vectors are never reprojected; otherwise the first raster does.
+function autoCrs(layers: ActiveLayer[], rasters: ActiveRaster[], current: WorldCrs) {
+  const vector = layers.find((layer) => typeof layer.grid !== 'string')
+  if (vector && typeof vector.grid !== 'string') return vector.grid.quad
+  return rasters.length ? rasterNative(rasters[0], current) : current
+}
+const keepIn = (crs: WorldCrs, layers: ActiveLayer[], rasters: ActiveRaster[]) => {
+  const keptLayers = layers.filter((layer) => vectorFits(layer, crs))
+  const keptRasters = rasters.filter((entry) => drawableIn(entry, crs))
+  return { keptLayers, keptRasters, dropped: layers.length - keptLayers.length + rasters.length - keptRasters.length }
+}
 
 function App() {
   const [endpoint, setEndpoint] = useState(() => initialParams.get('endpoint') ?? readStored(storedKey) ?? '')
   const [engine, setEngine] = useState<Engine>(initialEngine)
-  const [worldCrs, setWorldCrs] = useState<WorldCrs>(initialCrs)
+  const [crsMode, setCrsMode] = useState<CrsMode>(initialCrsMode)
+  const [worldCrs, setWorldCrs] = useState<WorldCrs>(() => { const mode = initialCrsMode(); return mode === 'auto' ? 'WorldCRS84Quad' : mode })
   const [tilesets, setTilesets] = useState<Tileset[]>([])
   const [active, setActive] = useState<ActiveLayer[]>([])
   const [choices, setChoices] = useState<Record<string, Choice>>({})
@@ -67,18 +87,18 @@ function App() {
     try {
       localStorage.setItem(storedKey, endpoint)
       localStorage.setItem(storedEngineKey, engine)
-      localStorage.setItem(storedCrsKey, worldCrs)
+      localStorage.setItem(storedCrsKey, crsMode)
       localStorage.setItem(storedRasterKey, JSON.stringify(raster))
     } catch { /* the viewer works without persisted state */ }
     const params = new URLSearchParams(location.search)
     const set = (key: string, value: string | undefined) => { if (value) params.set(key, value); else params.delete(key) }
     set('endpoint', endpoint)
     set('engine', engine === 'maplibre' ? undefined : engine)
-    set('crs', engine === 'maplibre' && worldCrs !== 'WorldCRS84Quad' ? worldCrs : undefined)
+    set('crs', engine === 'maplibre' && crsMode !== 'auto' ? crsMode : undefined)
     set('wmts', raster.mode === 'wmts' ? raster.url : undefined)
     set('csw', raster.mode === 'csw' ? raster.url : undefined)
     history.replaceState(null, '', `${location.pathname}?${params}`)
-  }, [endpoint, engine, worldCrs, raster])
+  }, [endpoint, engine, crsMode, raster])
 
   async function submit(event: FormEvent) {
     event.preventDefault(); setLoading(true); setDiagnostics([]); setTilesets([]); setActive([])
@@ -93,12 +113,45 @@ function App() {
 
   // The MapLibre map works in one world CRS at a time; switching it drops the layers the new CRS cannot draw.
   function switchWorldCrs(target: WorldCrs) {
-    const keptLayers = active.filter((layer) => typeof layer.grid !== 'string' && layer.grid.quad === target)
-    const keptRasters = rasters.filter((entry) => drawableIn(entry, target))
-    const dropped = active.length - keptLayers.length + rasters.length - keptRasters.length
-    if (dropped && !confirm(`Switch the map from ${worldCrs} to ${target}? ${dropped} layer${dropped === 1 ? '' : 's'} that cannot be drawn in ${target} will be removed.`)) return null
+    const kept = keepIn(target, active, rasters)
+    if (kept.dropped && !confirm(`Switch the map from ${worldCrs} to ${target}? ${kept.dropped} layer${kept.dropped === 1 ? '' : 's'} that cannot be drawn in ${target} will be removed.`)) return null
     setWorldCrs(target)
-    return { keptLayers, keptRasters }
+    return { ...kept, crs: target }
+  }
+
+  // Chooses the world CRS once a layer is added. In AUTO the new layer's own grid wins when every other layer can
+  // follow it; otherwise the map stays put if it can draw the layer, reprojecting a raster, and asks before dropping
+  // layers only when it cannot. A pinned CRS changes only when the layer cannot be drawn in it at all.
+  function placeLayer(native: WorldCrs, fits: (crs: WorldCrs) => boolean, title: string) {
+    if (crsMode === 'auto') {
+      const kept = keepIn(native, active, rasters)
+      if (!kept.dropped) { setWorldCrs(native); return { ...kept, crs: native } }
+      if (fits(worldCrs)) return { ...keepIn(worldCrs, active, rasters), crs: worldCrs }
+      return switchWorldCrs(native)
+    }
+    if (fits(worldCrs)) return { ...keepIn(worldCrs, active, rasters), crs: worldCrs }
+    const kept = keepIn(native, active, rasters)
+    if (!confirm(`${title} cannot be drawn in ${worldCrs}. Switch the map to ${native}?${kept.dropped ? ` ${kept.dropped} layer${kept.dropped === 1 ? '' : 's'} that cannot be drawn there will be removed.` : ''}`)) return null
+    setWorldCrs(native); setCrsMode(native)
+    return { ...kept, crs: native }
+  }
+
+  function removeLayers(layers: ActiveLayer[], remaining: ActiveRaster[]) {
+    // In AUTO, the map returns to the remaining layers' own grid when they can all be drawn there.
+    const target = engine === 'maplibre' && crsMode === 'auto' ? autoCrs(layers, remaining, worldCrs) : worldCrs
+    if (target !== worldCrs && !keepIn(target, layers, remaining).dropped) setWorldCrs(target)
+    setActive(layers); setRasters(remaining)
+  }
+
+  function changeCrsMode(mode: CrsMode) {
+    const target = mode === 'auto' ? autoCrs(active, rasters, worldCrs) : mode
+    if (target !== worldCrs) {
+      const kept = mode === 'auto' ? keepIn(target, active, rasters) : switchWorldCrs(target)
+      if (!kept) return
+      // AUTO never drops layers; it keeps the current CRS when the layers disagree.
+      if (!kept.dropped) { setWorldCrs(target); setActive(kept.keptLayers); setRasters(kept.keptRasters) }
+    }
+    setCrsMode(mode)
   }
 
   async function addLayer(tileset: Tileset) {
@@ -116,7 +169,7 @@ function App() {
         // OpenLayers knows EPSG:4326 and EPSG:3857 under every name, so the layer stays usable after an engine switch.
         const projectionCode = (await ensureProjection(matrixSet.crs, nextDiagnostics).catch(() => undefined)) ?? matrixSet.crs
         const next: ActiveLayer = { key, tileset, matrixSet: { ...matrixSet, crs: projectionCode }, tileUrl: tileLink.href, grid }
-        const kept = grid.quad === worldCrs ? { keptLayers: active, keptRasters: rasters } : switchWorldCrs(grid.quad)
+        const kept = placeLayer(grid.quad, (crs) => crs === grid.quad, tileset.title)
         if (!kept) return
         setRasters(kept.keptRasters)
         setActive([...kept.keptLayers.filter((layer) => layer.key !== key), next])
@@ -152,16 +205,13 @@ function App() {
       let kept = { keptLayers: active, keptRasters: rasters }
       let note = ''
       if (engine === 'maplibre') {
-        let crs = worldCrs
-        if (!drawableIn(next, worldCrs)) {
-          // A raster with only a Web Mercator grid cannot be drawn on a WorldCRS84Quad map; planRaster explains why otherwise.
-          crs = worldCrs === 'WorldCRS84Quad' ? 'WebMercatorQuad' : 'WorldCRS84Quad'
-          try { planRaster(next, crs) } catch (error) { throw new Error(`${describe(error)} Switch the engine to OpenLayers to draw it.`) }
-          const switched = switchWorldCrs(crs)
-          if (!switched) return
-          kept = switched
-        }
-        if (planRaster(next, crs).reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser${apiKey ? '; the reprojection plugin fetches them without the x-api-key header' : ''}.`
+        const native = rasterNative(next, worldCrs)
+        // planRaster explains why a raster cannot be drawn by MapLibre at all.
+        try { planRaster(next, native) } catch (error) { throw new Error(`${describe(error)} Switch the engine to OpenLayers to draw it.`) }
+        const placed = placeLayer(native, (crs) => drawableIn(next, crs), entry.title)
+        if (!placed) return
+        kept = placed
+        if (planRaster(next, placed.crs).reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser${apiKey ? '; the reprojection plugin fetches them without the x-api-key header' : ''}.`
       }
       setActive(kept.keptLayers)
       setRasters([...kept.keptRasters.filter((item) => item.key !== next.key), next])
@@ -172,13 +222,10 @@ function App() {
   function changeEngine(next: Engine) {
     if (next === engine) return
     if (next === 'maplibre') {
-      const drawable = active.flatMap((layer) => (typeof layer.grid === 'string' ? [] : [{ layer, quad: layer.grid.quad }]))
-      const quad = drawable[0]?.quad ?? worldCrs
-      const keptLayers = drawable.filter((entry) => entry.quad === quad).map((entry) => entry.layer)
-      const keptRasters = rasters.filter((entry) => drawableIn(entry, quad))
-      const dropped = active.length - keptLayers.length + rasters.length - keptRasters.length
-      if (dropped && !confirm(`MapLibre draws one of WorldCRS84Quad or WebMercatorQuad at a time. Remove the ${dropped} layer${dropped === 1 ? '' : 's'} it cannot draw in ${quad}?`)) return
-      setWorldCrs(quad); setActive(keptLayers); setRasters(keptRasters)
+      const quad = crsMode === 'auto' ? autoCrs(active, rasters, worldCrs) : worldCrs
+      const kept = keepIn(quad, active, rasters)
+      if (kept.dropped && !confirm(`MapLibre draws one of WorldCRS84Quad or WebMercatorQuad at a time. Remove the ${kept.dropped} layer${kept.dropped === 1 ? '' : 's'} it cannot draw in ${quad}?`)) return
+      setWorldCrs(quad); setActive(kept.keptLayers); setRasters(kept.keptRasters)
     }
     setEngine(next)
   }
@@ -215,8 +262,8 @@ function App() {
       <section className="map-settings"><h2>MAP</h2>
         <div className="segmented" role="radiogroup" aria-label="Map engine">{(['maplibre', 'openlayers'] as const).map((option) => <button type="button" key={option} role="radio" aria-checked={engine === option} className={engine === option ? 'selected' : ''} onClick={() => changeEngine(option)}>{option === 'maplibre' ? 'MAPLIBRE' : 'OPENLAYERS'}</button>)}</div>
         {engine === 'maplibre'
-          ? <><div className="segmented" role="radiogroup" aria-label="Map CRS">{(['WorldCRS84Quad', 'WebMercatorQuad'] as const).map((option) => <button type="button" key={option} role="radio" aria-checked={worldCrs === option} className={worldCrs === option ? 'selected' : ''} onClick={() => { const kept = option !== worldCrs && switchWorldCrs(option); if (kept) { setActive(kept.keptLayers); setRasters(kept.keptRasters) } }}>{quadLabel[option]}</button>)}</div>
-            <small>{worldCrs === 'WorldCRS84Quad' ? 'Tiles are requested and drawn natively in EPSG:4326.' : 'EPSG:4326 rasters are reprojected to Web Mercator in the browser.'}</small></>
+          ? <><div className="segmented" role="radiogroup" aria-label="Map CRS">{crsModes.map((mode) => <button type="button" key={mode} role="radio" aria-checked={crsMode === mode} title={mode === 'auto' ? 'Follow the layers' : quadLabel[mode]} className={crsMode === mode ? 'selected' : ''} onClick={() => changeCrsMode(mode)}>{crsModeLabel[mode]}</button>)}</div>
+            <small>{crsMode === 'auto' ? `Follows the layers, now ${quadLabel[worldCrs]}. Each layer is drawn in its own grid when the others allow it; otherwise EPSG:4326 rasters are reprojected.` : worldCrs === 'WorldCRS84Quad' ? 'Tiles are requested and drawn natively in EPSG:4326.' : 'EPSG:4326 rasters are reprojected to Web Mercator in the browser.'}</small></>
           : <small>OpenLayers follows the first layer&apos;s advertised CRS and grid, for any EPSG code.</small>}
       </section>
       <form onSubmit={submit}><label htmlFor="endpoint">API LANDING PAGE</label><div className="endpoint"><input id="endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://example.org/ogc" /><button disabled={loading}>{loading ? '...' : 'DISCOVER'}</button></div></form>
@@ -230,8 +277,8 @@ function App() {
         {rasterCatalog.map((entry) => <article className="tileset catalog-item" key={`${entry.capabilitiesUrl}#${entry.id}`}><div><strong>{entry.title}</strong><small>{entry.matrixSets.length ? entry.matrixSets.join(', ') : entry.wmtsLayerId}</small></div><button className="add" onClick={() => void addRaster(entry)} aria-label={`Add ${entry.title}`}>+</button></article>)}
       </section>
       <section><h2>LAYERS <b>{layerCount}</b></h2>
-        {active.map((layer) => <article className="tileset active" key={layer.key}><div><strong>{layer.tileset.title}</strong><small>{layer.matrixSet.id} · {layer.matrixSet.crs}</small></div><button className="remove" onClick={() => setActive((layers) => layers.filter((item) => item.key !== layer.key))}>REMOVE</button></article>)}
-        {rasters.map((entry) => <article className="tileset active raster" key={entry.key}><div><strong>{entry.title}</strong><small>raster · WMTS {entry.wmtsLayerId}</small></div><button className="remove" onClick={() => setRasters((items) => items.filter((item) => item.key !== entry.key))}>REMOVE</button></article>)}
+        {active.map((layer) => <article className="tileset active" key={layer.key}><div><strong>{layer.tileset.title}</strong><small>{layer.matrixSet.id} · {layer.matrixSet.crs}</small></div><button className="remove" onClick={() => removeLayers(active.filter((item) => item.key !== layer.key), rasters)}>REMOVE</button></article>)}
+        {rasters.map((entry) => <article className="tileset active raster" key={entry.key}><div><strong>{entry.title}</strong><small>raster · WMTS {entry.wmtsLayerId}</small></div><button className="remove" onClick={() => removeLayers(active, rasters.filter((item) => item.key !== entry.key))}>REMOVE</button></article>)}
       </section>
       <details><summary>DEVELOPER DIAGNOSTICS <b>{diagnostics.length}</b></summary>{diagnostics.length ? diagnostics.map((d, i) => <pre key={i}>{d.at} {d.status}\n{d.url}\n{d.detail}</pre>) : <p>No request failures recorded.</p>}</details></aside>
     <div className="map-wrap">{engine === 'maplibre' ? <MapLibreView key={worldCrs} worldCrs={worldCrs} {...viewProps} /> : <Suspense fallback={<div className="map" />}><OpenLayersView {...viewProps} /></Suspense>}</div>

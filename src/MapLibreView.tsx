@@ -9,6 +9,7 @@ import { lonLatBounds, quadLabel } from './crs'
 import type { Bounds } from './crs'
 import { FeaturePopup } from './FeaturePopup'
 import type { Hit } from './FeaturePopup'
+import { viewMemory } from './viewMemory'
 import { absolute } from './ogc'
 import { apiKeyHeaders, planRaster } from './wmts'
 import type { RasterPlan } from './wmts'
@@ -142,7 +143,7 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
   const mapElement = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const apiKeysRef = useRef<{ prefix: string; apiKey: string }[]>([])
-  const fittedRef = useRef(new Set<string>())
+  const layerCountRef = useRef<number | null>(null)
   const onErrorRef = useRef(onError)
   const [popupElement] = useState(() => document.createElement('div'))
   const [hits, setHits] = useState<{ click: number; hits: Hit[] }>({ click: 0, hits: [] })
@@ -158,7 +159,7 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
     // The world CRS is process-wide and baked into tile coordinates, so it is set before the map exists.
     setWorldCRS(worldCrs)
     const map = new MapLibreMap({
-      container: mapElement.current!, center: [0, 0], zoom: 1, attributionControl: false,
+      container: mapElement.current!, center: viewMemory.current?.center ?? [0, 0], zoom: viewMemory.current?.zoom ?? 1, attributionControl: false,
       transformRequest: (url) => {
         const apiKey = apiKeysRef.current.find((entry) => url.startsWith(entry.prefix))?.apiKey
         return apiKey ? { url, headers: apiKeyHeaders(apiKey) } : { url }
@@ -167,7 +168,7 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
     map.addControl(new NavigationControl({ showCompass: false }), 'top-left')
     map.addControl(new ScaleControl({ unit: 'metric' }), 'bottom-right')
     mapRef.current = map
-    const fitted = fittedRef.current
+    map.on('moveend', () => { viewMemory.current = { center: map.getCenter().toArray(), zoom: map.getZoom() } })
     const popup = new Popup({ closeButton: false, closeOnClick: false, maxWidth: 'none', className: 'feature-popup' }).setDOMContent(popupElement)
     let click = 0
     map.on('click', (event) => {
@@ -190,7 +191,7 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
       if (sourceId) reported.add(sourceId)
       onErrorRef.current({ url: sourceId ?? 'MapLibre', status: sourceId ? 'Tile request failed' : 'MapLibre error', detail: event.error?.message ?? String(event.error) })
     })
-    return () => { popup.remove(); map.remove(); mapRef.current = null; fitted.clear() }
+    return () => { popup.remove(); map.remove(); mapRef.current = null; layerCountRef.current = null }
   }, [worldCrs, popupElement])
 
   useEffect(() => {
@@ -205,14 +206,15 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
     apiKeysRef.current = plans.filter((plan) => plan.raster.apiKey && !plan.reprojected).map((plan) => ({ prefix: plan.tiles.tileUrl('{z}', '{x}', '{y}').split('{')[0], apiKey: plan.raster.apiKey }))
     map.setStyle(buildStyle(layers, plans, appliedStyle, hueFor), { diff: true })
     map.showTileBoundaries = showTileDebug
-    // Frame each layer once, when it is first added.
     const extents: { key: string; bounds?: Bounds }[] = [
       ...layers.map((layer) => ({ key: layer.key, bounds: layer.tileset.boundingBox && lonLatBounds(layer.tileset.boundingBox.lowerLeft, layer.tileset.boundingBox.upperRight, layer.tileset.boundingBox.crs ?? layer.matrixSet.crs) })),
       ...plans.map((plan) => ({ key: plan.raster.key, bounds: plan.tiles.bounds })),
     ]
-    const added = extents.filter((extent) => !fittedRef.current.has(extent.key))
-    extents.forEach((extent) => fittedRef.current.add(extent.key))
-    const target = added.findLast((extent) => extent.bounds)?.bounds
+    const previousCount = layerCountRef.current
+    layerCountRef.current = extents.length
+    // Frame the first layer put on an empty map. Adding more layers, or rebuilding the map for another world CRS,
+    // keeps the view the user is looking at.
+    const target = previousCount === 0 || (previousCount === null && !viewMemory.current) ? extents.findLast((extent) => extent.bounds)?.bounds : undefined
     const worldEdge = worldCrs === 'WebMercatorQuad' ? mercatorLatitude : 90
     if (target) map.fitBounds([target[0], Math.max(target[1], -worldEdge), target[2], Math.min(target[3], worldEdge)], { padding: 50, duration: 300 })
   }, [layers, rasters, appliedStyle, showTileDebug, hueFor, worldCrs, layerNamesVersion])

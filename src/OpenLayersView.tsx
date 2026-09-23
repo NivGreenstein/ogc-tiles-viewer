@@ -17,11 +17,12 @@ import Overlay from 'ol/Overlay'
 import TileState from 'ol/TileState'
 import type ImageTile from 'ol/ImageTile'
 import { defaults as defaultControls, ScaleLine } from 'ol/control'
-import { get as getProjection } from 'ol/proj'
+import { fromLonLat, get as getProjection, toLonLat, transformExtent } from 'ol/proj'
 import { applyStyle } from 'ol-mapbox-style'
 import 'ol/ol.css'
 import { FeaturePopup } from './FeaturePopup'
 import type { Hit } from './FeaturePopup'
+import { metersPerPixelFromZoom, viewMemory, zoomFromMetersPerPixel } from './viewMemory'
 import { apiKeyHeaders, findLayer } from './wmts'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError } from './types'
 
@@ -55,7 +56,7 @@ function wmtsSource(raster: ActiveRaster, projection: string | undefined) {
 export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, hueFor, onError }: Props) {
   const mapElement = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
-  const viewKeyRef = useRef('')
+  const layerCountRef = useRef<number | null>(null)
   const onErrorRef = useRef(onError)
   const [popupElement] = useState(() => document.createElement('div'))
   const [hits, setHits] = useState<{ click: number; hits: Hit[] }>({ click: 0, hits: [] })
@@ -73,13 +74,23 @@ export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, h
       map.forEachFeatureAtPixel(event.pixel, (feature) => { found.push({ properties: feature.getProperties() }); return undefined })
       setHits({ click: ++click, hits: found }); overlay.setPosition(found.length ? event.coordinate : undefined)
     })
-    return () => { map.setTarget(undefined); mapRef.current = null; viewKeyRef.current = '' }
+    map.on('moveend', () => {
+      const view = map.getView()
+      const center = view.getCenter()
+      const resolution = view.getResolution()
+      if (!center || !resolution) return
+      const projection = view.getProjection()
+      viewMemory.current = { center: toLonLat(center, projection) as [number, number], zoom: zoomFromMetersPerPixel(resolution * (projection.getMetersPerUnit() ?? 1)) }
+    })
+    return () => { map.setTarget(undefined); mapRef.current = null; layerCountRef.current = null }
   }, [popupElement])
 
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
     map.getLayers().clear()
+    const previousCount = layerCountRef.current
+    layerCountRef.current = layers.length + rasters.length
     // The first vector layer's matrix set decides the projection; with rasters alone, the first raster's does.
     let rasterProjection: string | undefined
     const rasterLayers = rasters.flatMap((raster) => {
@@ -97,12 +108,21 @@ export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, h
     const projection = crsCode ? getProjection(crsCode) : null
     if (!projection) return
     let stale = false
-    const box = layers[0]?.tileset.boundingBox
-    const viewKey = `${crsCode}|${[...layers, ...rasters].map((layer) => layer.key).join(',')}`
-    if (viewKeyRef.current !== viewKey) {
-      viewKeyRef.current = viewKey
-      map.setView(new View({ projection, center: box?.lowerLeft ?? [0, 0], zoom: layers.length ? 0 : 2 }))
-      if (box?.lowerLeft.length === 2 && box.upperRight.length === 2 && (!box.crs || box.crs === crsCode)) map.getView().fit([...box.lowerLeft, ...box.upperRight], { padding: [50, 50, 50, 330], duration: 300 })
+    if (map.getView().getProjection() !== projection) {
+      // A new projection needs a new view; it opens where the previous view, in either engine, was.
+      const remembered = viewMemory.current
+      map.setView(new View(remembered
+        ? { projection, center: fromLonLat(remembered.center, projection), resolution: metersPerPixelFromZoom(remembered.zoom) / (projection.getMetersPerUnit() ?? 1) }
+        : { projection, center: [0, 0], zoom: 2 }))
+    }
+    // Frame the first layer put on an empty map; adding more layers keeps the view the user is looking at.
+    if (previousCount === 0 || (previousCount === null && !viewMemory.current)) {
+      const box = layers[0]?.tileset.boundingBox
+      const rasterBox = rasters[0] && findLayer(rasters[0].capabilities, rasters[0].wmtsLayerId)?.WGS84BoundingBox
+      const extent = layers.length
+        ? box?.lowerLeft.length === 2 && box.upperRight.length === 2 && (!box.crs || box.crs === crsCode) ? [...box.lowerLeft, ...box.upperRight] : undefined
+        : rasterBox && transformExtent([rasterBox[0], Math.max(rasterBox[1], -85), rasterBox[2], Math.min(rasterBox[3], 85)], 'EPSG:4326', projection)
+      if (extent) map.getView().fit(extent, { padding: [50, 50, 50, 50], duration: 300 })
     }
     rasterLayers.forEach((layer) => map.addLayer(layer))
     for (const layer of layers) {
