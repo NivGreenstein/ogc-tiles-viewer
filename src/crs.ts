@@ -8,7 +8,7 @@ type GridMatrix = { id: string; matrixWidth: number; matrixHeight: number; tileW
 
 const mercatorEdge = 20037508.342789244
 // OGC scale denominators assume 0.28 mm pixels; a degree is converted at the WGS 84 equator.
-const metersPerDegree = 2 * Math.PI * 6378137 / 360
+export const metersPerDegree = 2 * Math.PI * 6378137 / 360
 const mercatorCodes = ['3857', '900913', '3785', '102100', '102113']
 const epsgCode = (crs: string) => crs.match(/EPSG.*?[:/](\d+)$/i)?.[1] ?? crs.match(/^\d+$/)?.[0]
 const near = (value: number, target: number, tolerance: number) => Math.abs(Math.abs(value) - target) <= tolerance
@@ -65,4 +65,22 @@ export function lonLatBounds(lowerLeft: number[], upperRight: number[], crs: str
   if (quad !== 'WorldCRS84Quad') return undefined
   const latitudeFirst = epsgCode(crs ?? '') === '4326' && Math.abs(lowerLeft[0]) <= 90 && Math.abs(upperRight[0]) <= 90
   return clampBounds(latitudeFirst ? [lowerLeft[1], lowerLeft[0], upperRight[1], upperRight[0]] : [lowerLeft[0], lowerLeft[1], upperRight[0], upperRight[1]])
+}
+
+// A plate carrée tile matrix: EPSG:4326 pixels of `pixelSize` degrees counted from (-180, 90). NASA GIBS publishes
+// such sets whose tiles do not divide the world by powers of two, so they are resampled rather than addressed.
+export type PlateCarreeMatrix = { id: string; pixelSize: number; tileSize: number; matrixWidth: number; matrixHeight: number }
+
+export function plateCarreeMatrices(crs: string, matrices: GridMatrix[]): PlateCarreeMatrix[] | string {
+  if (crsQuad(crs) !== 'WorldCRS84Quad') return `${crs || 'An unspecified CRS'} is not EPSG:4326.`
+  if (!matrices.length) return 'The tile matrix set lists no tile matrices.'
+  const result: PlateCarreeMatrix[] = []
+  for (const matrix of matrices) {
+    const [x = NaN, y = NaN] = matrix.origin
+    // EPSG:4326 corners may be written latitude-first.
+    if (!((near(x, 180, 1e-6) && x < 0 && near(y, 90, 1e-6) && y > 0) || (near(x, 90, 1e-6) && x > 0 && near(y, 180, 1e-6) && y < 0))) return `Tile matrix ${matrix.id} does not start at the north-west corner of the world.`
+    if (matrix.tileWidth !== matrix.tileHeight) return `Tile matrix ${matrix.id} has non-square tiles.`
+    result.push({ id: matrix.id, pixelSize: matrix.cellSize || matrix.scaleDenominator * 0.00028 / metersPerDegree, tileSize: matrix.tileWidth, matrixWidth: matrix.matrixWidth, matrixHeight: matrix.matrixHeight })
+  }
+  return result
 }

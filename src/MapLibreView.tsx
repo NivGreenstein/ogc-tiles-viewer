@@ -11,6 +11,7 @@ import { FeaturePopup } from './FeaturePopup'
 import type { Hit } from './FeaturePopup'
 import { viewMemory } from './viewMemory'
 import { absolute } from './ogc'
+import { regridLoader, regridMaxZoom, regridProtocol, registerRegrid } from './regrid'
 import { apiKeyHeaders, planRaster } from './wmts'
 import type { RasterPlan } from './wmts'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError, WorldCrs } from './types'
@@ -88,9 +89,11 @@ addProtocol(vectorProtocol, async ({ url }, abortController) => {
 // EPSG:4326 raster tiles are drawn on a Web Mercator map by reprojecting them in the browser.
 const reprojection = createProtocol({ ...epsg4326ToEpsg3857Presets })
 addProtocol(reprojection.protocol, reprojection.loader)
+addProtocol(regridProtocol, regridLoader)
 
-function rasterSource({ tiles, reprojected }: RasterPlan): StyleSpecification['sources'][string] {
+function rasterSource({ raster, tiles, reprojected }: RasterPlan, worldCrs: WorldCrs): StyleSpecification['sources'][string] {
   const bounds: Bounds | undefined = tiles.bounds && (reprojected ? [tiles.bounds[0], Math.max(tiles.bounds[1], -mercatorLatitude), tiles.bounds[2], Math.min(tiles.bounds[3], mercatorLatitude)] : tiles.bounds)
+  if (tiles.kind === 'plate-carree') return { type: 'raster', tiles: [registerRegrid(raster.key, { tiles, apiKey: raster.apiKey, worldCrs })], tileSize: 256, minzoom: 0, maxzoom: regridMaxZoom(tiles, worldCrs), ...(bounds ? { bounds } : {}) }
   if (!reprojected) return { type: 'raster', tiles: [tiles.tileUrl('{z}', '{x}', '{y}')], tileSize: tiles.tileSize, minzoom: tiles.minLevel, maxzoom: tiles.maxLevel, ...(bounds ? { bounds } : {}) }
   // The plugin requests source level z - 1 for a mercator tile at z, which keeps the pixel sizes alike.
   const size = tiles.tileSize === 256 ? '' : `&ssize=${tiles.tileSize}`
@@ -108,7 +111,7 @@ const generatedLayers = (key: string, sourceLayer: string, hue: number): LayerSp
   ] as LayerSpecification[]
 }
 
-function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], appliedStyle: AppliedStyle | null, hueFor: (key: string) => number): StyleSpecification {
+function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], appliedStyle: AppliedStyle | null, hueFor: (key: string) => number, worldCrs: WorldCrs): StyleSpecification {
   const style: StyleSpecification = { version: 8, sources: {}, layers: [] }
   const document = appliedStyle?.document
   const resolve = (href: string) => (appliedStyle?.styleUrl ? absolute(href, appliedStyle.styleUrl) : href)
@@ -118,7 +121,7 @@ function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], appliedStyle: Ap
   const styleLayers = ((document?.layers as LayerSpecification[] | undefined) ?? [])
   style.layers.push(...styleLayers.filter((layer) => layer.type === 'background'))
   for (const plan of plans) {
-    style.sources[rasterSourceId(plan.raster.key)] = rasterSource(plan)
+    style.sources[rasterSourceId(plan.raster.key)] = rasterSource(plan, worldCrs)
     style.layers.push({ id: rasterSourceId(plan.raster.key), type: 'raster', source: rasterSourceId(plan.raster.key) })
   }
   for (const layer of layers) {
@@ -203,8 +206,9 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
         return []
       }
     })
-    apiKeysRef.current = plans.filter((plan) => plan.raster.apiKey && !plan.reprojected).map((plan) => ({ prefix: plan.tiles.tileUrl('{z}', '{x}', '{y}').split('{')[0], apiKey: plan.raster.apiKey }))
-    map.setStyle(buildStyle(layers, plans, appliedStyle, hueFor), { diff: true })
+    // Resampled tiles are fetched by their own protocols, which send the key themselves where they can.
+    apiKeysRef.current = plans.flatMap(({ raster, tiles, reprojected }) => (raster.apiKey && !reprojected && tiles.kind === 'quad' ? [{ prefix: tiles.tileUrl('{z}', '{x}', '{y}').split('{')[0], apiKey: raster.apiKey }] : []))
+    map.setStyle(buildStyle(layers, plans, appliedStyle, hueFor, worldCrs), { diff: true })
     map.showTileBoundaries = showTileDebug
     const extents: { key: string; bounds?: Bounds }[] = [
       ...layers.map((layer) => ({ key: layer.key, bounds: layer.tileset.boundingBox && lonLatBounds(layer.tileset.boundingBox.lowerLeft, layer.tileset.boundingBox.upperRight, layer.tileset.boundingBox.crs ?? layer.matrixSet.crs) })),

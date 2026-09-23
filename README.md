@@ -104,7 +104,7 @@ Our WMTS raster provider serves EPSG:4326 `WorldCRS84Quad` tiles only:
 - On a **WorldCRS84Quad** map the tiles are drawn natively.
 - On a **WebMercatorQuad** map a layer's EPSG:3857 matrix set is used when it has one. Otherwise its EPSG:4326 tiles are reprojected in the browser by [`@nivgreen/maplibre-gl-raster-reprojection`](https://github.com/NivGreenstein/maplibre-gl-raster-reprojection), which requests the level below each mercator tile. The plugin fetches source tiles itself and does not send the `x-api-key` header, so a raster behind an API-key header draws only on a WorldCRS84Quad map.
 - A raster with only an EPSG:3857 matrix set cannot be drawn on a WorldCRS84Quad map. In AUTO the map switches for it when no layer is lost, and otherwise asks.
-- A matrix set is only drawn by MapLibre when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. NASA GIBS' EPSG:4326 sets, for example, use 512 px tiles that span 288 degrees at level 0, so MapLibre refuses them and OpenLayers draws them.
+- A matrix set is only addressed directly when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. Other EPSG:4326 matrix sets whose tiles start at the north-west corner of the world are resampled instead. [NASA GIBS](https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/1.0.0/WMTSCapabilities.xml), for example, publishes 512 px tiles that span 288 degrees at level 0. For each map tile, the viewer picks the coarsest GIBS level at least as detailed as the tile, fetches the GIBS tiles covering it, and crops and scales them into place. On a WorldCRS84Quad map both grids are plate carrée, so this is an exact rescale. On a Web Mercator map the tile is resampled one pixel row at a time. These requests carry the `x-api-key` header.
 
 OpenLayers draws WMTS rasters with `ol/source/WMTS`, preferring a matrix set in the map's projection and otherwise reprojecting.
 
@@ -153,6 +153,8 @@ src/MapLibreView.tsx    MapLibre map (the default engine), vector tile protocol,
 src/OpenLayersView.tsx  OpenLayers map, loaded only when selected
 src/ogc.ts              OGC API Tiles discovery, tile matrix sets, and projection registration
 src/wmts.ts             WMTS capabilities, MapColonies CSW, and WMTS tile URL resolution
-src/crs.ts              WorldCRS84Quad and WebMercatorQuad recognition and bounding boxes
+src/crs.ts              WorldCRS84Quad, WebMercatorQuad and plate carrée recognition, and bounding boxes
+src/regrid.ts           Resampling of plate carrée WMTS tiles, such as NASA GIBS, onto the map grid
+src/viewMemory.ts       The last map view, shared across CRS and engine switches
 src/index.css           Desktop GIS workspace styling
 ```

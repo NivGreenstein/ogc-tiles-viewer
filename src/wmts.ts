@@ -1,6 +1,6 @@
 import WMTSCapabilities from 'ol/format/WMTSCapabilities'
-import { lonLatBounds, quadGrid } from './crs'
-import type { Bounds, QuadGrid } from './crs'
+import { lonLatBounds, plateCarreeMatrices, quadGrid } from './crs'
+import type { Bounds, PlateCarreeMatrix, QuadGrid } from './crs'
 import type { ActiveRaster, Capabilities, Diagnostic, RasterEntry, WorldCrs } from './types'
 
 // The parts of ol/format/WMTSCapabilities output this viewer reads.
@@ -13,7 +13,9 @@ type WmtsLayer = {
 }
 type WmtsMatrixSet = { Identifier: string; SupportedCRS?: string; TileMatrix?: { Identifier: string; ScaleDenominator: number; TopLeftCorner: number[]; TileWidth: number; TileHeight: number; MatrixWidth: number; MatrixHeight: number }[] }
 type GetTileDcp = { href: string; Constraint?: { name: string; AllowedValues?: { Value?: string[] } }[] }
-export type WmtsTiles = QuadGrid & { matrixSet: string; bounds?: Bounds; tileUrl: (level: string, col: string, row: string) => string }
+export type QuadTiles = QuadGrid & { kind: 'quad'; matrixSet: string; bounds?: Bounds; tileUrl: (level: string, col: string, row: string) => string }
+export type PlateCarreeTiles = { kind: 'plate-carree'; matrixSet: string; matrices: PlateCarreeMatrix[]; bounds?: Bounds; matrixUrl: (matrix: string, col: string, row: string) => string }
+export type WmtsTiles = QuadTiles | PlateCarreeTiles
 
 export const apiKeyHeaders = (apiKey: string): Record<string, string> => (apiKey ? { 'x-api-key': apiKey } : {})
 const capabilitiesCache = new Map<string, Promise<Capabilities>>()
@@ -107,47 +109,67 @@ function getTileKvpUrl(capabilities: Capabilities) {
   return kvp?.href
 }
 
-// Resolves the tile grid and URL template of a WMTS layer, choosing the first of the preferred grids it advertises.
-export function resolveWmtsTiles(capabilities: Capabilities, wmtsLayerId: string, preferred: WorldCrs[]): WmtsTiles {
-  const layer = findLayer(capabilities, wmtsLayerId)
-  if (!layer) throw new Error(`Layer ${wmtsLayerId} is not in the WMTS capabilities.`)
-  const reasons: string[] = []
-  const candidates = (layer.TileMatrixSetLink ?? []).flatMap((link) => {
-    const matrixSet = matrixSetsOf(capabilities).find((set) => set.Identifier === link.TileMatrixSet)
-    if (!matrixSet) return []
-    const grid = quadGrid(matrixSet.SupportedCRS ?? '', (matrixSet.TileMatrix ?? []).map((matrix) => ({ id: matrix.Identifier, matrixWidth: matrix.MatrixWidth, matrixHeight: matrix.MatrixHeight, tileWidth: matrix.TileWidth, tileHeight: matrix.TileHeight, origin: matrix.TopLeftCorner, scaleDenominator: matrix.ScaleDenominator })))
-    if (typeof grid === 'string') { reasons.push(`${link.TileMatrixSet}: ${grid}`); return [] }
-    // TileMatrixSetLimits narrows the levels the layer actually has tiles for.
-    const limited = (link.TileMatrixSetLimits ?? []).map((limit) => Number(limit.TileMatrix.slice(grid.prefix.length))).filter(Number.isInteger)
-    return [{ ...grid, matrixSet: link.TileMatrixSet, ...(limited.length ? { minLevel: Math.min(...limited), maxLevel: Math.max(...limited) } : {}) }]
-  })
-  const grid = preferred.map((quad) => candidates.find((candidate) => candidate.quad === quad)).find(Boolean)
-  if (!grid) throw new Error(`${layer.Title ?? layer.Identifier} advertises no ${preferred.join(' or ')} tile matrix set.${reasons.length ? ` ${reasons.join(' ')}` : ''}`)
+// Builds a layer's tile URL for one matrix set, from its RESTful template or else its KVP GetTile endpoint, with the
+// default style and dimension values filled in; {TileMatrix}, {TileCol} and {TileRow} are left to the caller.
+function tileTemplate(capabilities: Capabilities, layer: WmtsLayer, matrixSet: string) {
   const style = (layer.Style ?? []).find((entry) => entry.isDefault)?.Identifier ?? layer.Style?.[0]?.Identifier ?? 'default'
   const resources = (layer.ResourceURL ?? []).filter((resource) => resource.resourceType === 'tile')
   const resource = resources.find((entry) => entry.format === layer.Format?.[0]) ?? resources[0]
   let template: string
-  if (resource) template = resource.template.replace(/\{Style\}/gi, encodeURIComponent(style)).replace(/\{TileMatrixSet\}/gi, encodeURIComponent(grid.matrixSet))
+  if (resource) template = resource.template.replace(/\{Style\}/gi, encodeURIComponent(style)).replace(/\{TileMatrixSet\}/gi, encodeURIComponent(matrixSet))
   else {
     const href = getTileKvpUrl(capabilities)
     if (!href) throw new Error(`${layer.Identifier} has neither a RESTful tile template nor a KVP GetTile endpoint.`)
     const url = new URL(href, location.href)
-    for (const [key, value] of Object.entries({ SERVICE: 'WMTS', REQUEST: 'GetTile', VERSION: '1.0.0', LAYER: layer.Identifier, STYLE: style, FORMAT: layer.Format?.[0] ?? 'image/png', TILEMATRIXSET: grid.matrixSet })) url.searchParams.set(key, value)
+    for (const [key, value] of Object.entries({ SERVICE: 'WMTS', REQUEST: 'GetTile', VERSION: '1.0.0', LAYER: layer.Identifier, STYLE: style, FORMAT: layer.Format?.[0] ?? 'image/png', TILEMATRIXSET: matrixSet })) url.searchParams.set(key, value)
     template = `${url}&TILEMATRIX={TileMatrix}&TILEROW={TileRow}&TILECOL={TileCol}`
   }
   for (const dimension of layer.Dimension ?? []) template = template.replace(new RegExp(`\\{${dimension.Identifier}\\}`, 'gi'), encodeURIComponent(dimension.Default ?? dimension.Value?.[0] ?? ''))
+  return (matrix: string, col: string, row: string) => template.replace(/\{TileMatrix\}/gi, matrix).replace(/\{TileCol\}/gi, col).replace(/\{TileRow\}/gi, row)
+}
+
+// Resolves how a WMTS layer's tiles are drawn: addressed directly when it advertises one of the preferred quad grids,
+// otherwise resampled from an EPSG:4326 plate carrée matrix set such as NASA GIBS publishes.
+export function resolveWmtsTiles(capabilities: Capabilities, wmtsLayerId: string, preferred: WorldCrs[]): WmtsTiles {
+  const layer = findLayer(capabilities, wmtsLayerId)
+  if (!layer) throw new Error(`Layer ${wmtsLayerId} is not in the WMTS capabilities.`)
+  const reasons: string[] = []
+  const links = (layer.TileMatrixSetLink ?? []).flatMap((link) => {
+    const matrixSet = matrixSetsOf(capabilities).find((set) => set.Identifier === link.TileMatrixSet)
+    if (!matrixSet) return []
+    // TileMatrixSetLimits narrows the levels the layer actually has tiles for.
+    const limited = new Set((link.TileMatrixSetLimits ?? []).map((limit) => limit.TileMatrix))
+    const matrices = (matrixSet.TileMatrix ?? []).map((matrix) => ({ id: matrix.Identifier, matrixWidth: matrix.MatrixWidth, matrixHeight: matrix.MatrixHeight, tileWidth: matrix.TileWidth, tileHeight: matrix.TileHeight, origin: matrix.TopLeftCorner, scaleDenominator: matrix.ScaleDenominator }))
+    return [{ link, crs: matrixSet.SupportedCRS ?? '', matrices, limited }]
+  })
+  const quads = links.flatMap(({ link, crs, matrices, limited }) => {
+    const grid = quadGrid(crs, matrices)
+    if (typeof grid === 'string') { reasons.push(`${link.TileMatrixSet}: ${grid}`); return [] }
+    const levels = [...limited].map((id) => Number(id.slice(grid.prefix.length))).filter(Number.isInteger)
+    return [{ ...grid, matrixSet: link.TileMatrixSet, ...(levels.length ? { minLevel: Math.min(...levels), maxLevel: Math.max(...levels) } : {}) }]
+  })
   const box = layer.WGS84BoundingBox
-  return {
-    ...grid, bounds: box ? lonLatBounds(box.slice(0, 2), box.slice(2, 4), 'CRS84') : undefined,
-    tileUrl: (level, col, row) => template.replace(/\{TileMatrix\}/gi, `${grid.prefix}${level}`).replace(/\{TileCol\}/gi, col).replace(/\{TileRow\}/gi, row),
+  const bounds = box ? lonLatBounds(box.slice(0, 2), box.slice(2, 4), 'CRS84') : undefined
+  const grid = preferred.map((quad) => quads.find((candidate) => candidate.quad === quad)).find(Boolean)
+  if (grid) {
+    const url = tileTemplate(capabilities, layer, grid.matrixSet)
+    return { ...grid, kind: 'quad', bounds, tileUrl: (level, col, row) => url(`${grid.prefix}${level}`, col, row) }
   }
+  for (const { link, crs, matrices, limited } of links) {
+    const plateCarree = plateCarreeMatrices(crs, matrices)
+    if (typeof plateCarree === 'string') continue
+    const usable = plateCarree.filter((matrix) => !limited.size || limited.has(matrix.id))
+    if (usable.length) return { kind: 'plate-carree', matrixSet: link.TileMatrixSet, matrices: usable, bounds, matrixUrl: tileTemplate(capabilities, layer, link.TileMatrixSet) }
+  }
+  throw new Error(`${layer.Title ?? layer.Identifier} advertises no ${preferred.join(' or ')} or EPSG:4326 tile matrix set.${reasons.length ? ` ${reasons.join(' ')}` : ''}`)
 }
 
 export type RasterPlan = { raster: ActiveRaster; tiles: WmtsTiles; reprojected: boolean }
 
-// Our WMTS rasters are WorldCRS84Quad: native on a WorldCRS84Quad map, reprojected on a Web Mercator one.
+// Our WMTS rasters are WorldCRS84Quad: native on a WorldCRS84Quad map, reprojected on a Web Mercator one. A plate
+// carrée raster is resampled, which a WorldCRS84Quad map does without reprojecting.
 export function planRaster(raster: ActiveRaster, worldCrs: WorldCrs): RasterPlan {
   const preferred: WorldCrs[] = worldCrs === 'WorldCRS84Quad' ? ['WorldCRS84Quad'] : ['WebMercatorQuad', 'WorldCRS84Quad']
   const tiles = resolveWmtsTiles(raster.capabilities, raster.wmtsLayerId, preferred)
-  return { raster, tiles, reprojected: tiles.quad !== worldCrs }
+  return { raster, tiles, reprojected: (tiles.kind === 'quad' ? tiles.quad : 'WorldCRS84Quad') !== worldCrs }
 }

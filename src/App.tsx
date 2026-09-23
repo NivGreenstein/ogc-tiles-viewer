@@ -211,7 +211,9 @@ function App() {
         const placed = placeLayer(native, (crs) => drawableIn(next, crs), entry.title)
         if (!placed) return
         kept = placed
-        if (planRaster(next, placed.crs).reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser${apiKey ? '; the reprojection plugin fetches them without the x-api-key header' : ''}.`
+        const plan = planRaster(next, placed.crs)
+        if (plan.tiles.kind === 'plate-carree') note = ` Its ${plan.tiles.matrixSet} tiles do not follow the ${placed.crs} grid, so they are resampled in the browser.`
+        else if (plan.reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser${apiKey ? '; the reprojection plugin fetches them without the x-api-key header' : ''}.`
       }
       setActive(kept.keptLayers)
       setRasters([...kept.keptRasters.filter((item) => item.key !== next.key), next])
