@@ -18,7 +18,7 @@ import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError, WorldCrs } f
 
 type StyleSpecification = Exclude<Parameters<MapLibreMap['setStyle']>[0], string | null>
 type LayerSpecification = StyleSpecification['layers'][number]
-type Props = { worldCrs: WorldCrs; layers: ActiveLayer[]; rasters: ActiveRaster[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
+type Props = { worldCrs: WorldCrs; layers: ActiveLayer[]; rasters: ActiveRaster[]; order: string[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
 
 setWorkerUrl(workerUrl)
 // MapLibre lays text out left to right; Hebrew and Arabic labels need this plugin to be shaped and ordered. It is
@@ -116,7 +116,7 @@ const generatedLayers = (key: string, sourceLayer: string, hue: number): LayerSp
   ] as LayerSpecification[]
 }
 
-function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], appliedStyle: AppliedStyle | null, hueFor: (key: string) => number, worldCrs: WorldCrs): StyleSpecification {
+function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], order: string[], appliedStyle: AppliedStyle | null, hueFor: (key: string) => number, worldCrs: WorldCrs): StyleSpecification {
   const style: StyleSpecification = { version: 8, sources: {}, layers: [] }
   const document = appliedStyle?.document
   const resolve = (href: string) => (appliedStyle?.styleUrl ? absolute(href, appliedStyle.styleUrl) : href)
@@ -124,10 +124,11 @@ function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], appliedStyle: Ap
   if (typeof document?.sprite === 'string') style.sprite = resolve(document.sprite)
   else if (Array.isArray(document?.sprite)) style.sprite = (document.sprite as { id: string; url: string }[]).map((sprite) => ({ ...sprite, url: resolve(sprite.url) }))
   const styleLayers = ((document?.layers as LayerSpecification[] | undefined) ?? [])
-  style.layers.push(...styleLayers.filter((layer) => layer.type === 'background'))
+  // The style layers drawing each active layer, stacked below in the user's order.
+  const drawn = new Map<string, LayerSpecification[]>()
   for (const plan of plans) {
     style.sources[rasterSourceId(plan.raster.key)] = rasterSource(plan, worldCrs)
-    style.layers.push({ id: rasterSourceId(plan.raster.key), type: 'raster', source: rasterSourceId(plan.raster.key) })
+    drawn.set(plan.raster.key, [{ id: rasterSourceId(plan.raster.key), type: 'raster', source: rasterSourceId(plan.raster.key) }])
   }
   for (const layer of layers) {
     if (typeof layer.grid === 'string') continue
@@ -137,17 +138,20 @@ function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], appliedStyle: Ap
     const bounds = box && lonLatBounds(box.lowerLeft, box.upperRight, box.crs ?? layer.matrixSet.crs)
     style.sources[vectorSourceId(layer.key)] = { type: 'vector', tiles: [`${vectorProtocol}://${encodeURIComponent(layer.key)}@${tiles}`], minzoom: grid.minLevel, maxzoom: grid.maxLevel, ...(bounds ? { bounds } : {}) }
     // MapLibre only loads a source that a layer draws, and the generated layers wait for the names the tiles carry.
-    style.layers.push({ id: `${layer.key}::probe`, type: 'fill', source: vectorSourceId(layer.key), 'source-layer': 'ogc-tiles-viewer-probe' })
+    const group: LayerSpecification[] = [{ id: `${layer.key}::probe`, type: 'fill', source: vectorSourceId(layer.key), 'source-layer': 'ogc-tiles-viewer-probe' }]
     if (appliedStyle) {
       // Text needs glyphs, and a style without them would fail validation as a whole.
-      const drawn = styleLayers.filter((styleLayer) => 'source' in styleLayer && styleLayer.source === appliedStyle.source && (style.glyphs || !(styleLayer.type === 'symbol' && styleLayer.layout?.['text-field'])))
-      style.layers.push(...drawn.map((styleLayer) => ({ ...styleLayer, id: `${layer.key}::${styleLayer.id}`, source: vectorSourceId(layer.key) }) as LayerSpecification))
-    } else for (const sourceLayer of sourceLayers.get(layer.key) ?? []) style.layers.push(...generatedLayers(layer.key, sourceLayer, hueFor(layer.key)))
+      const applied = styleLayers.filter((styleLayer) => 'source' in styleLayer && styleLayer.source === appliedStyle.source && (style.glyphs || !(styleLayer.type === 'symbol' && styleLayer.layout?.['text-field'])))
+      group.push(...applied.map((styleLayer) => ({ ...styleLayer, id: `${layer.key}::${styleLayer.id}`, source: vectorSourceId(layer.key) }) as LayerSpecification))
+    } else for (const sourceLayer of sourceLayers.get(layer.key) ?? []) group.push(...generatedLayers(layer.key, sourceLayer, hueFor(layer.key)))
+    drawn.set(layer.key, group)
   }
+  const bottomUp = [...drawn.keys()].sort((a, b) => order.indexOf(b) - order.indexOf(a))
+  style.layers.push(...styleLayers.filter((layer) => layer.type === 'background'), ...bottomUp.flatMap((key) => drawn.get(key) ?? []))
   return style
 }
 
-export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTileDebug, hueFor, onError }: Props) {
+export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, showTileDebug, hueFor, onError }: Props) {
   const mapElement = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
   const apiKeysRef = useRef<{ prefix: string; apiKey: string }[]>([])
@@ -213,7 +217,7 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
     })
     // Resampled tiles are fetched by their own protocols, which send the key themselves where they can.
     apiKeysRef.current = plans.flatMap(({ raster, tiles, reprojected }) => (raster.apiKey && !reprojected && tiles.kind === 'quad' ? [{ prefix: tiles.tileUrl('{z}', '{x}', '{y}').split('{')[0], apiKey: raster.apiKey }] : []))
-    map.setStyle(buildStyle(layers, plans, appliedStyle, hueFor, worldCrs), { diff: true })
+    map.setStyle(buildStyle(layers, plans, order, appliedStyle, hueFor, worldCrs), { diff: true })
     map.showTileBoundaries = showTileDebug
     const extents: { key: string; bounds?: Bounds }[] = [
       ...layers.map((layer) => ({ key: layer.key, bounds: layer.tileset.boundingBox && lonLatBounds(layer.tileset.boundingBox.lowerLeft, layer.tileset.boundingBox.upperRight, layer.tileset.boundingBox.crs ?? layer.matrixSet.crs) })),
@@ -226,7 +230,7 @@ export function MapLibreView({ worldCrs, layers, rasters, appliedStyle, showTile
     const target = previousCount === 0 || (previousCount === null && !viewMemory.current) ? extents.findLast((extent) => extent.bounds)?.bounds : undefined
     const worldEdge = worldCrs === 'WebMercatorQuad' ? mercatorLatitude : 90
     if (target) map.fitBounds([target[0], Math.max(target[1], -worldEdge), target[2], Math.min(target[3], worldEdge)], { padding: 50, duration: 300 })
-  }, [layers, rasters, appliedStyle, showTileDebug, hueFor, worldCrs, layerNamesVersion])
+  }, [layers, rasters, order, appliedStyle, showTileDebug, hueFor, worldCrs, layerNamesVersion])
 
   return <>
     <div ref={mapElement} className={appliedStyle ? 'map styled' : 'map'} />

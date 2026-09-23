@@ -19,6 +19,8 @@ The viewer does not need a backend or proxy. It follows links advertised by an O
 - Render vector tiles using their advertised tile matrix set, origin, resolutions, tile size, and CRS.
 - Never assume Web Mercator. Missing EPSG definitions are requested from `epsg.io` and registered with `proj4`.
 - Pick the map CRS automatically from the layers you add, and keep the current view when layers are added or the CRS or engine changes.
+- Search and pick raster layers in a collapsible drawer, and reorder all layers by drag and drop.
+- Draw Hebrew and Arabic labels correctly with the MapLibre RTL text plugin, bundled and loaded on demand.
 - Inspect all vector features hit by a map click and view their raw properties.
 - Show metadata, request diagnostics, scale, CRS, and a tile debug grid.
 - Apply a MapLibre style, pasted or fetched from a URL, without replacing the discovered OGC source.
@@ -85,6 +87,8 @@ MapLibre only draws a vector `source-layer` that a style layer names. Every OGC 
 
 **OPENLAYERS** follows the first layer's advertised CRS and tile matrix set for any EPSG code, as described under [CRS Behavior](#crs-behavior). Switching back to MapLibre keeps the layers it can draw and asks before removing the rest.
 
+**LAYERS** lists every active layer, vector and raster, in drawing order: the top of the list is drawn above the rest. Drag a layer by its handle to reorder it, or focus the handle and use the up and down arrow keys. A new vector layer is placed on top, and a new raster above the other rasters but beneath the vector layers.
+
 In both engines the map zooms to the first layer added to an empty map. Adding further layers, switching the CRS, or switching the engine keeps the current view.
 
 ## Raster (WMTS And CSW)
@@ -93,6 +97,8 @@ The **RASTER** section loads raster layers from either source:
 
 - **WMTS CAPABILITIES**: a WMTS GetCapabilities URL. Every layer in the document is listed. Kept in the `wmts` query parameter.
 - **MAPCOLONIES CSW**: a MapColonies raster catalog CSW endpoint. The viewer posts a `GetRecords` request for `mc:MCRasterRecord` records of type `RECORD_RASTER`, following `nextRecord` to page through the catalog. Each record's `WMTS` link (or `WMTS_KVP`) names the capabilities URL and, in its `name` attribute, the WMTS layer. The capabilities are loaded when the layer is added. Kept in the `csw` query parameter.
+
+After **LOAD**, the layers the source offers are listed in the **AVAILABLE LAYERS** drawer, which can be collapsed and scrolls when the list is long. Its search field filters by title, identifier and tile matrix set, and each layer's checkbox adds it to the map or removes it.
 
 An optional API key is sent as the `x-api-key` header on CSW, capabilities, and tile requests. It is held in memory only and is never written to the URL or local storage.
 

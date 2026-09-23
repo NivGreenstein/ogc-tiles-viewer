@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import { crsQuad, quadGrid, quadLabel } from './crs'
 import { MapLibreView } from './MapLibreView'
@@ -34,6 +34,8 @@ const initialRaster = (): { mode: RasterMode; url: string } => {
 }
 // Whether the MapLibre map can draw a raster in the given world CRS, natively or reprojected.
 const drawableIn = (raster: ActiveRaster, worldCrs: WorldCrs) => { try { planRaster(raster, worldCrs); return true } catch { return false } }
+const rasterKey = (entry: RasterEntry) => `raster:${entry.capabilitiesUrl}#${entry.wmtsLayerId}`
+const matchesQuery = (entry: RasterEntry, query: string) => [entry.title, entry.id, entry.wmtsLayerId, ...entry.matrixSets].some((text) => text.toLocaleLowerCase().includes(query))
 const otherCrs = (crs: WorldCrs): WorldCrs => (crs === 'WorldCRS84Quad' ? 'WebMercatorQuad' : 'WorldCRS84Quad')
 const vectorFits = (layer: ActiveLayer, crs: WorldCrs) => typeof layer.grid !== 'string' && layer.grid.quad === crs
 // The world CRS a raster is drawn in without reprojection, preferring the current one when it has both grids.
@@ -71,7 +73,19 @@ function App() {
   const [rasterCatalog, setRasterCatalog] = useState<RasterEntry[]>([])
   const [rasterLoading, setRasterLoading] = useState(false)
   const [rasters, setRasters] = useState<ActiveRaster[]>([])
+  const [rasterQuery, setRasterQuery] = useState('')
+  const [rasterDrawerOpen, setRasterDrawerOpen] = useState(true)
+  // Draw order of every active layer, topmost first; layers missing from it are drawn beneath the rest.
+  const [layerOrder, setLayerOrder] = useState<string[]>([])
+  const [dragging, setDragging] = useState<{ key: string; over?: string } | null>(null)
   const layerCount = active.length + rasters.length
+  // Stable between renders, so the maps only restack when the layers or their order change.
+  const order = useMemo(() => {
+    const activeKeys = [...active.map((layer) => layer.key), ...rasters.map((entry) => entry.key)]
+    return [...layerOrder.filter((key) => activeKeys.includes(key)), ...activeKeys.filter((key) => !layerOrder.includes(key))]
+  }, [active, rasters, layerOrder])
+  const query = rasterQuery.trim().toLocaleLowerCase()
+  const visibleRasters = query ? rasterCatalog.filter((entry) => matchesQuery(entry, query)) : rasterCatalog
   const groupedTilesets = tilesets.reduce<Record<string, Tileset[]>>((groups, set) => {
     const matrixSet = set.tileMatrixSetId ?? 'Unspecified tile matrix set'
     ;(groups[matrixSet] ??= []).push(set)
@@ -136,6 +150,22 @@ function App() {
     return { ...kept, crs: native }
   }
 
+  // A new vector layer goes on top; a new raster goes above the other rasters but beneath the vector layers.
+  function placeOnTop(key: string, kind: 'vector' | 'raster') {
+    setLayerOrder(() => {
+      const rest = order.filter((item) => item !== key)
+      const firstRaster = rest.findIndex((item) => rasters.some((entry) => entry.key === item))
+      const at = kind === 'vector' ? 0 : firstRaster < 0 ? rest.length : firstRaster
+      return [...rest.slice(0, at), key, ...rest.slice(at)]
+    })
+  }
+
+  function moveLayer(key: string, to: number) {
+    const rest = order.filter((item) => item !== key)
+    const at = Math.max(0, Math.min(rest.length, to))
+    setLayerOrder([...rest.slice(0, at), key, ...rest.slice(at)])
+  }
+
   function removeLayers(layers: ActiveLayer[], remaining: ActiveRaster[]) {
     // In AUTO, the map returns to the remaining layers' own grid when they can all be drawn there.
     const target = engine === 'maplibre' && crsMode === 'auto' ? autoCrs(layers, remaining, worldCrs) : worldCrs
@@ -173,6 +203,7 @@ function App() {
         if (!kept) return
         setRasters(kept.keptRasters)
         setActive([...kept.keptLayers.filter((layer) => layer.key !== key), next])
+        placeOnTop(key, 'vector')
         return
       }
       const projectionCode = (await ensureProjection(matrixSet.crs, nextDiagnostics)) ?? matrixSet.crs
@@ -181,6 +212,7 @@ function App() {
       const next: ActiveLayer = { key, tileset, matrixSet: { ...matrixSet, crs: projectionCode }, tileUrl: tileLink.href, grid }
       const replacing = existingProjection && existingProjection !== projectionCode
       setActive((previous) => replacing ? [next] : [...previous.filter((layer) => layer.key !== key), next])
+      placeOnTop(key, 'vector')
     } catch (error) { setDiagnostics(nextDiagnostics); setMessage(`Could not add ${tileset.title}: ${describe(error)}`) }
   }
 
@@ -201,7 +233,7 @@ function App() {
     const nextDiagnostics: Diagnostic[] = []
     try {
       const capabilities = await loadCapabilities(entry.capabilitiesUrl, apiKey, nextDiagnostics)
-      const next: ActiveRaster = { key: `raster:${entry.capabilitiesUrl}#${entry.wmtsLayerId}`, title: entry.title, capabilities, wmtsLayerId: entry.wmtsLayerId, apiKey }
+      const next: ActiveRaster = { key: rasterKey(entry), title: entry.title, capabilities, wmtsLayerId: entry.wmtsLayerId, apiKey }
       let kept = { keptLayers: active, keptRasters: rasters }
       let note = ''
       if (engine === 'maplibre') {
@@ -217,6 +249,7 @@ function App() {
       }
       setActive(kept.keptLayers)
       setRasters([...kept.keptRasters.filter((item) => item.key !== next.key), next])
+      placeOnTop(next.key, 'raster')
       setMessage(`Added ${entry.title}.${note}`)
     } catch (error) { setMessage(`Could not add ${entry.title}: ${describe(error)}`) } finally { setDiagnostics((current) => [...current, ...nextDiagnostics]) }
   }
@@ -257,7 +290,7 @@ function App() {
     } catch (error) { setMessage(`Could not load style: ${describe(error)}`) }
   }
 
-  const viewProps = { layers: active, rasters, appliedStyle, showTileDebug, hueFor, onError: reportError }
+  const viewProps = { layers: active, rasters, order, appliedStyle, showTileDebug, hueFor, onError: reportError }
   return <main className="app">
     <header><div className="brand"><span>OGC</span> TILES / VECTOR + RASTER WORKBENCH</div><div className="status"><i /> {layerCount ? `${layerCount} ACTIVE LAYER${layerCount > 1 ? 'S' : ''}` : 'NO LAYERS ACTIVE'}</div></header>
     <aside className="sidebar">
@@ -276,11 +309,29 @@ function App() {
           <div className="endpoint"><input aria-label={raster.mode === 'csw' ? 'CSW URL' : 'WMTS capabilities URL'} value={raster.url} onChange={(e) => setRaster((current) => ({ ...current, url: e.target.value }))} placeholder={raster.mode === 'csw' ? 'https://example.org/raster-catalog/csw' : 'https://example.org/wmts/1.0.0/WMTSCapabilities.xml'} /><button disabled={rasterLoading}>{rasterLoading ? '...' : 'LOAD'}</button></div>
           <div className="endpoint"><input type="password" aria-label="API key" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Optional x-api-key" /></div>
         </form>
-        {rasterCatalog.map((entry) => <article className="tileset catalog-item" key={`${entry.capabilitiesUrl}#${entry.id}`}><div><strong>{entry.title}</strong><small>{entry.matrixSets.length ? entry.matrixSets.join(', ') : entry.wmtsLayerId}</small></div><button className="add" onClick={() => void addRaster(entry)} aria-label={`Add ${entry.title}`}>+</button></article>)}
+        {rasterCatalog.length > 0 && <details className="raster-drawer" open={rasterDrawerOpen} onToggle={(event) => { const isOpen = event.currentTarget.open; setRasterDrawerOpen(isOpen) }}>
+          <summary>AVAILABLE LAYERS <b>{query ? `${visibleRasters.length}/${rasterCatalog.length}` : rasterCatalog.length}</b></summary>
+          <input type="search" className="raster-search" aria-label="Search raster layers" placeholder="Search by title, identifier or matrix set" value={rasterQuery} onChange={(e) => setRasterQuery(e.target.value)} />
+          <div className="raster-list" role="group" aria-label="Raster layers">
+            {visibleRasters.map((entry) => { const selected = rasters.some((item) => item.key === rasterKey(entry)); return <label className={selected ? 'tileset raster-option selected' : 'tileset raster-option'} key={`${entry.capabilitiesUrl}#${entry.id}`}><input type="checkbox" checked={selected} onChange={() => { if (selected) removeLayers(active, rasters.filter((item) => item.key !== rasterKey(entry))); else void addRaster(entry) }} aria-label={`Show ${entry.title}`} /><div><strong>{entry.title}</strong><small>{entry.matrixSets.length ? entry.matrixSets.join(', ') : entry.wmtsLayerId}</small></div></label> })}
+            {!visibleRasters.length && <p className="empty">No raster layer matches “{rasterQuery.trim()}”.</p>}
+          </div>
+        </details>}
       </section>
       <section><h2>LAYERS <b>{layerCount}</b></h2>
-        {active.map((layer) => <article className="tileset active" key={layer.key}><div><strong>{layer.tileset.title}</strong><small>{layer.matrixSet.id} · {layer.matrixSet.crs}</small></div><button className="remove" onClick={() => removeLayers(active.filter((item) => item.key !== layer.key), rasters)}>REMOVE</button></article>)}
-        {rasters.map((entry) => <article className="tileset active raster" key={entry.key}><div><strong>{entry.title}</strong><small>raster · WMTS {entry.wmtsLayerId}</small></div><button className="remove" onClick={() => removeLayers(active, rasters.filter((item) => item.key !== entry.key))}>REMOVE</button></article>)}
+        {layerCount > 1 && <small className="hint">Drag the handle, or focus it and use the arrow keys, to reorder. The top layer is drawn above the others.</small>}
+        <ol className="layer-order">{order.map((key, index) => {
+          const vector = active.find((layer) => layer.key === key)
+          const entry = rasters.find((item) => item.key === key)
+          const title = vector?.tileset.title ?? entry?.title ?? key
+          const remove = () => (vector ? removeLayers(active.filter((item) => item.key !== key), rasters) : removeLayers(active, rasters.filter((item) => item.key !== key)))
+          const classes = ['tileset', 'active', entry ? 'raster' : '', dragging?.key === key ? 'dragging' : '', dragging && dragging.over === key && dragging.key !== key ? (order.indexOf(dragging.key) < index ? 'drop-below' : 'drop-above') : ''].filter(Boolean).join(' ')
+          return <li key={key} className={classes} draggable onDragStart={(event) => { event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', key); setDragging({ key }) }} onDragOver={(event) => { if (!dragging) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; if (dragging.over !== key) setDragging({ ...dragging, over: key }) }} onDrop={(event) => { event.preventDefault(); if (dragging) moveLayer(dragging.key, index); setDragging(null) }} onDragEnd={() => setDragging(null)}>
+            <button type="button" className="drag-handle" aria-label={`Reorder ${title}, position ${index + 1} of ${order.length}`} title="Drag to reorder, or use the arrow keys" onKeyDown={(event) => { if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); moveLayer(key, index + (event.key === 'ArrowUp' ? -1 : 1)) } }}>⠿</button>
+            <div><strong>{title}</strong><small>{vector ? `${vector.matrixSet.id} · ${vector.matrixSet.crs}` : `raster · WMTS ${entry?.wmtsLayerId}`}</small></div>
+            <button className="remove" onClick={remove}>REMOVE</button>
+          </li>
+        })}</ol>
       </section>
       <details><summary>DEVELOPER DIAGNOSTICS <b>{diagnostics.length}</b></summary>{diagnostics.length ? diagnostics.map((d, i) => <pre key={i}>{d.at} {d.status}\n{d.url}\n{d.detail}</pre>) : <p>No request failures recorded.</p>}</details></aside>
     <div className="map-wrap">{engine === 'maplibre' ? <MapLibreView key={worldCrs} worldCrs={worldCrs} {...viewProps} /> : <Suspense fallback={<div className="map" />}><OpenLayersView {...viewProps} /></Suspense>}</div>

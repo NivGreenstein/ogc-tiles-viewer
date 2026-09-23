@@ -27,7 +27,7 @@ import { apiKeyHeaders, findLayer } from './wmts'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError } from './types'
 
 type GlStyle = Parameters<typeof applyStyle>[1]
-type Props = { layers: ActiveLayer[]; rasters: ActiveRaster[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
+type Props = { layers: ActiveLayer[]; rasters: ActiveRaster[]; order: string[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
 
 function wmtsSource(raster: ActiveRaster, projection: string | undefined) {
   const layer = findLayer(raster.capabilities, raster.wmtsLayerId)
@@ -53,7 +53,7 @@ function wmtsSource(raster: ActiveRaster, projection: string | undefined) {
   })
 }
 
-export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, hueFor, onError }: Props) {
+export function OpenLayersView({ layers, rasters, order, appliedStyle, showTileDebug, hueFor, onError }: Props) {
   const mapElement = useRef<HTMLDivElement>(null)
   const mapRef = useRef<Map | null>(null)
   const layerCountRef = useRef<number | null>(null)
@@ -89,6 +89,8 @@ export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, h
     const map = mapRef.current
     if (!map) return
     map.getLayers().clear()
+    // The first key in the order is drawn on top.
+    const zIndex = (key: string) => order.length - order.indexOf(key)
     const previousCount = layerCountRef.current
     layerCountRef.current = layers.length + rasters.length
     // The first vector layer's matrix set decides the projection; with rasters alone, the first raster's does.
@@ -97,7 +99,7 @@ export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, h
       try {
         const source = wmtsSource(raster, layers[0]?.matrixSet.crs ?? rasterProjection)
         rasterProjection ??= source.getProjection()?.getCode()
-        return [new TileLayer({ source })]
+        return [new TileLayer({ source, zIndex: zIndex(raster.key) })]
       } catch (error) {
         onErrorRef.current({ url: raster.title, status: 'Raster could not be drawn', detail: error instanceof Error ? error.message : String(error) })
         return []
@@ -131,7 +133,7 @@ export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, h
       const grid = new TileGrid({ extent: layer.tileset.boundingBox && (!layer.tileset.boundingBox.crs || layer.tileset.boundingBox.crs === layer.matrixSet.crs) ? [...layer.tileset.boundingBox.lowerLeft, ...layer.tileset.boundingBox.upperRight] : undefined, origins: matrices.map((m) => m.pointOfOrigin), resolutions: matrices.map((m) => m.cellSize || m.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((m) => [m.tileWidth, m.tileHeight]) })
       const source = new VectorTileSource({ format: new MVT(), projection, tileGrid: grid, tileUrlFunction: ([z, x, y]) => layer.tileUrl.replace(/\{tileMatrix\}/gi, matrices[z].id).replace(/\{tileCol\}/gi, String(x)).replace(/\{tileRow\}/gi, String(y)) })
       const tileUrlFunction = source.getTileUrlFunction()
-      const vectorLayer = new VectorTileLayer({ source, declutter: Boolean(appliedStyle) })
+      const vectorLayer = new VectorTileLayer({ source, declutter: Boolean(appliedStyle), zIndex: zIndex(layer.key) })
       const hue = hueFor(layer.key)
       vectorLayer.setStyle((feature) => {
         const geometry = feature.getGeometry()?.getType()
@@ -159,13 +161,13 @@ export function OpenLayersView({ layers, rasters, appliedStyle, showTileDebug, h
       const matrices = layers[0].matrixSet.tileMatrices
       const meters = projection.getMetersPerUnit() ?? 1
       const grid = new TileGrid({ origins: matrices.map((matrix) => matrix.pointOfOrigin), resolutions: matrices.map((matrix) => matrix.cellSize || matrix.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((matrix) => [matrix.tileWidth, matrix.tileHeight]) })
-      map.addLayer(new TileLayer({ source: new TileDebug({ projection, tileGrid: grid }) }))
+      map.addLayer(new TileLayer({ source: new TileDebug({ projection, tileGrid: grid }), zIndex: order.length + 1 }))
     } else if (showTileDebug) {
       const grid = rasterLayers[0]?.getSource()?.getTileGrid()
-      if (grid) map.addLayer(new TileLayer({ source: new TileDebug({ projection, tileGrid: grid }) }))
+      if (grid) map.addLayer(new TileLayer({ source: new TileDebug({ projection, tileGrid: grid }), zIndex: order.length + 1 }))
     }
     return () => { stale = true }
-  }, [layers, rasters, appliedStyle, showTileDebug, hueFor])
+  }, [layers, rasters, order, appliedStyle, showTileDebug, hueFor])
 
   return <>
     <div ref={mapElement} className={appliedStyle ? 'map styled' : 'map'} />
