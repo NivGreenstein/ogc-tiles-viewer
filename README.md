@@ -74,12 +74,12 @@ The viewer deliberately does not infer a `/tiles` route from a landing page.
 
 ## Map Engines
 
-The **MAP** section selects the engine. The choice is kept in the `engine` query parameter when it is not the default.
+The **MAP** section selects the engine. A non-default choice is kept in the [shareable URL](#shareable-links).
 
 **MAPLIBRE** is the default. It works in one of the two tile matrix sets the MapLibre fork supports: **WorldCRS84Quad** (EPSG:4326, plate carrée, no reprojection) or **WebMercatorQuad** (EPSG:3857). The map CRS control under the engine offers:
 
 - **AUTO**, the default: the layers choose. The layer you add is drawn in its own grid when every layer already on the map can follow it there. When some cannot, the map stays in its current CRS if it can still draw the new layer (reprojecting an EPSG:4326 raster to Web Mercator), and asks before removing layers only when it cannot. Removing a layer returns the map to the remaining layers' own grid when they can all be drawn there.
-- **EPSG:4326** or **EPSG:3857** pins the map CRS; an EPSG:4326 raster added to a pinned Web Mercator map is reprojected. A pinned map changes CRS only when a layer cannot be drawn in it at all, after asking. The pinned choice is kept in the `crs` query parameter.
+- **EPSG:4326** or **EPSG:3857** pins the map CRS; an EPSG:4326 raster added to a pinned Web Mercator map is reprojected. A pinned map changes CRS only when a layer cannot be drawn in it at all, after asking. The pinned choice is kept in the [shareable URL](#shareable-links).
 
 The fork's world CRS is a process-wide setting, so changing it recreates the map, which reopens at the same place and zoom. A vector tileset is drawn natively when its tile matrix set is one of those two grids, recognised from its CRS, the shape, pixel size and origin of each tile matrix rather than from its identifier. The tile matrix identifiers must be the level number, optionally behind a fixed prefix such as `EPSG:4326:`. A tileset in any other grid is refused with a hint to switch engines.
 
@@ -95,8 +95,8 @@ In both engines the map zooms to the first layer added to an empty map. Adding f
 
 The **RASTER** section loads raster layers from either source:
 
-- **WMTS CAPABILITIES**: a WMTS GetCapabilities URL. Every layer in the document is listed. Kept in the `wmts` query parameter.
-- **MAPCOLONIES CSW**: a MapColonies raster catalog CSW endpoint. The viewer posts a `GetRecords` request for `mc:MCRasterRecord` records of type `RECORD_RASTER`, following `nextRecord` to page through the catalog. Each record's `WMTS` link (or `WMTS_KVP`) names the capabilities URL and, in its `name` attribute, the WMTS layer. The capabilities are loaded when the layer is added. Kept in the `csw` query parameter.
+- **WMTS CAPABILITIES**: a WMTS GetCapabilities URL. Every layer in the document is listed.
+- **MAPCOLONIES CSW**: a MapColonies raster catalog CSW endpoint. The viewer posts a `GetRecords` request for `mc:MCRasterRecord` records of type `RECORD_RASTER`, following `nextRecord` to page through the catalog. Each record's `WMTS` link (or `WMTS_KVP`) names the capabilities URL and, in its `name` attribute, the WMTS layer. The capabilities are loaded when the layer is added.
 
 After **LOAD**, the layers the source offers are listed in the **AVAILABLE LAYERS** drawer, which can be collapsed and scrolls when the list is long. Its search field filters by title, identifier and tile matrix set, and each layer's checkbox adds it to the map or removes it.
 
@@ -113,6 +113,12 @@ Our WMTS raster provider serves EPSG:4326 `WorldCRS84Quad` tiles only:
 - A matrix set is only addressed directly when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. Other EPSG:4326 matrix sets whose tiles start at the north-west corner of the world are resampled instead. [NASA GIBS](https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/1.0.0/WMTSCapabilities.xml), for example, publishes 512 px tiles that span 288 degrees at level 0. For each map tile, the viewer picks the coarsest GIBS level at least as detailed as the tile, fetches the GIBS tiles covering it, and crops and scales them into place. On a WorldCRS84Quad map both grids are plate carrée, so this is an exact rescale. On a Web Mercator map the tile is resampled one pixel row at a time. These requests carry the `x-api-key` header.
 
 OpenLayers draws WMTS rasters with `ol/source/WMTS`, preferring a matrix set in the map's projection and otherwise reprojecting.
+
+## Shareable Links
+
+The address bar carries the landing page, the WMTS or CSW URL, the engine and a pinned map CRS, so a copied link reopens the same setup. They are kept in a single `s` query parameter: JSON with one-letter keys, compressed with zlib using a preset dictionary of common OGC and WMTS URL fragments, and base64url-encoded. A typical link with a landing page and a WMTS URL comes out around 40% shorter than the plain parameters. The API key is never put in the URL.
+
+Links in the older form, with plain `endpoint`, `wmts`, `csw`, `engine` and `crs` parameters, still open, and are rewritten into the compressed form. The dictionary is part of the link format, so it must not change: a link made with a different dictionary would no longer decode.
 
 ## Tile Matrix Debugging
 
@@ -162,5 +168,6 @@ src/wmts.ts             WMTS capabilities, MapColonies CSW, and WMTS tile URL re
 src/crs.ts              WorldCRS84Quad, WebMercatorQuad and plate carrée recognition, and bounding boxes
 src/regrid.ts           Resampling of plate carrée WMTS tiles, such as NASA GIBS, onto the map grid
 src/viewMemory.ts       The last map view, shared across CRS and engine switches
+src/urlState.ts         The compressed, shareable URL state
 src/index.css           Desktop GIS workspace styling
 ```

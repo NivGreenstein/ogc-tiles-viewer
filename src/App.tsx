@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { crsQuad, quadGrid, quadLabel } from './crs'
 import { MapLibreView } from './MapLibreView'
 import { byRel, chooseStyleSource, discover, ensureProjection, loadMatrixSet } from './ogc'
+import { readUrlState, writeUrlState } from './urlState'
 import { capabilitiesEntries, loadCapabilities, loadCswCatalog, planRaster } from './wmts'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, Choice, Diagnostic, Engine, RasterEntry, ReportError, StyleDocument, Tileset, WorldCrs } from './types'
 import './App.css'
@@ -19,15 +20,14 @@ const storedRasterKey = 'ogc-tiles-viewer-raster'
 const OpenLayersView = lazy(() => import('./OpenLayersView').then((module) => ({ default: module.OpenLayersView })))
 const hueFor = (key: string) => [...key].reduce((hue, character) => (hue * 31 + character.charCodeAt(0)) % 360, 7)
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error))
-const initialParams = new URLSearchParams(location.search)
+const initialState = readUrlState()
 const readStored = (key: string) => { try { return localStorage.getItem(key) } catch { return null } }
-const initialEngine = (): Engine => ((initialParams.get('engine') ?? readStored(storedEngineKey)) === 'openlayers' ? 'openlayers' : 'maplibre')
+const initialEngine = (): Engine => ((initialState.engine ?? readStored(storedEngineKey)) === 'openlayers' ? 'openlayers' : 'maplibre')
 const crsModes = ['auto', 'WorldCRS84Quad', 'WebMercatorQuad'] as const
 const crsModeLabel: Record<CrsMode, string> = { auto: 'AUTO', WorldCRS84Quad: 'EPSG:4326', WebMercatorQuad: 'EPSG:3857' }
-const initialCrsMode = (): CrsMode => crsModes.find((mode) => mode === (initialParams.get('crs') ?? readStored(storedCrsKey))) ?? 'auto'
+const initialCrsMode = (): CrsMode => crsModes.find((mode) => mode === (initialState.crs ?? readStored(storedCrsKey))) ?? 'auto'
 const initialRaster = (): { mode: RasterMode; url: string } => {
-  const csw = initialParams.get('csw')
-  const wmts = initialParams.get('wmts')
+  const { csw, wmts } = initialState
   if (csw) return { mode: 'csw', url: csw }
   if (wmts) return { mode: 'wmts', url: wmts }
   try { return { mode: 'wmts', url: '', ...JSON.parse(readStored(storedRasterKey) ?? '{}') } } catch { return { mode: 'wmts', url: '' } }
@@ -53,7 +53,7 @@ const keepIn = (crs: WorldCrs, layers: ActiveLayer[], rasters: ActiveRaster[]) =
 }
 
 function App() {
-  const [endpoint, setEndpoint] = useState(() => initialParams.get('endpoint') ?? readStored(storedKey) ?? '')
+  const [endpoint, setEndpoint] = useState(() => initialState.endpoint ?? readStored(storedKey) ?? '')
   const [engine, setEngine] = useState<Engine>(initialEngine)
   const [crsMode, setCrsMode] = useState<CrsMode>(initialCrsMode)
   const [worldCrs, setWorldCrs] = useState<WorldCrs>(() => { const mode = initialCrsMode(); return mode === 'auto' ? 'WorldCRS84Quad' : mode })
@@ -104,14 +104,13 @@ function App() {
       localStorage.setItem(storedCrsKey, crsMode)
       localStorage.setItem(storedRasterKey, JSON.stringify(raster))
     } catch { /* the viewer works without persisted state */ }
-    const params = new URLSearchParams(location.search)
-    const set = (key: string, value: string | undefined) => { if (value) params.set(key, value); else params.delete(key) }
-    set('endpoint', endpoint)
-    set('engine', engine === 'maplibre' ? undefined : engine)
-    set('crs', engine === 'maplibre' && crsMode !== 'auto' ? crsMode : undefined)
-    set('wmts', raster.mode === 'wmts' ? raster.url : undefined)
-    set('csw', raster.mode === 'csw' ? raster.url : undefined)
-    history.replaceState(null, '', `${location.pathname}?${params}`)
+    writeUrlState({
+      endpoint,
+      engine: engine === 'maplibre' ? undefined : engine,
+      crs: engine === 'maplibre' && crsMode !== 'auto' ? crsMode : undefined,
+      wmts: raster.mode === 'wmts' ? raster.url : undefined,
+      csw: raster.mode === 'csw' ? raster.url : undefined,
+    })
   }, [endpoint, engine, crsMode, raster])
 
   async function submit(event: FormEvent) {
