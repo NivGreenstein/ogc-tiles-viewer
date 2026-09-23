@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mapbox/mapbox-gl-rtl-text": "^0.4.0",
     "@nivgreen/maplibre-gl-js-crs84": "^6.7.0-rc.1",
     "@nivgreen/maplibre-gl-raster-reprojection": "^1.1.0",
     "ol": "^10.10.0",

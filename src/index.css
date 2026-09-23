@@ -96,3 +96,6 @@ dd { margin: 5px 0 0; color: #d0dbd0; font-size: 11px; white-space: pre-wrap; ov
 .map .maplibregl-ctrl-scale { margin: 0 15px 15px 0; border-color: #e4f0dc; color: #e4f0dc; background: #142018dd; font-size: 10px; }
 .feature-popup .maplibregl-popup-content { padding: 0; background: transparent; box-shadow: none; }
 .feature-popup .maplibregl-popup-tip { display: none; }
+
+/* Layer titles, messages and feature properties can be Hebrew or Arabic; each line takes its direction from its own text. */
+strong, small, .message, .popup pre, .popup option, .tileset select, dd, details pre { unicode-bidi: plaintext; }

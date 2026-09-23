@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Map as MapLibreMap, NavigationControl, Popup, ScaleControl, addProtocol, setWorkerUrl, setWorldCRS } from '@nivgreen/maplibre-gl-js-crs84'
+import { Map as MapLibreMap, NavigationControl, Popup, ScaleControl, addProtocol, getRTLTextPluginStatus, setRTLTextPlugin, setWorkerUrl, setWorldCRS } from '@nivgreen/maplibre-gl-js-crs84'
 import { createProtocol, epsg4326ToEpsg3857Presets } from '@nivgreen/maplibre-gl-raster-reprojection'
 import '@nivgreen/maplibre-gl-js-crs84/dist/maplibre-gl.css'
 // MapLibre v6 cannot locate its worker inside a bundle; Vite emits it as a self-contained chunk.
@@ -21,6 +21,11 @@ type LayerSpecification = StyleSpecification['layers'][number]
 type Props = { worldCrs: WorldCrs; layers: ActiveLayer[]; rasters: ActiveRaster[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
 
 setWorkerUrl(workerUrl)
+// MapLibre lays text out left to right; Hebrew and Arabic labels need this plugin to be shaped and ordered. It is
+// bundled rather than fetched from a CDN, and loaded lazily, only once a label in those scripts appears.
+// The package only exports its source, so its browser build is referenced by path.
+const rtlTextPluginUrl = new URL('../node_modules/@mapbox/mapbox-gl-rtl-text/dist/mapbox-gl-rtl-text.js', import.meta.url)
+if (getRTLTextPluginStatus() === 'unavailable') void setRTLTextPlugin(rtlTextPluginUrl.href, true)
 
 const mercatorLatitude = 85.051129
 const vectorProtocol = 'ogc-vector'
