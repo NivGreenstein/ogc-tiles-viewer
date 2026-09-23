@@ -11,7 +11,7 @@ type WmtsLayer = {
   TileMatrixSetLink?: { TileMatrixSet: string; TileMatrixSetLimits?: { TileMatrix: string }[] }[]
   ResourceURL?: { format: string; template: string; resourceType: string }[]
 }
-type WmtsMatrixSet = { Identifier: string; SupportedCRS?: string; TileMatrix?: { Identifier: string; TopLeftCorner: number[]; TileWidth: number; TileHeight: number; MatrixWidth: number; MatrixHeight: number }[] }
+type WmtsMatrixSet = { Identifier: string; SupportedCRS?: string; TileMatrix?: { Identifier: string; ScaleDenominator: number; TopLeftCorner: number[]; TileWidth: number; TileHeight: number; MatrixWidth: number; MatrixHeight: number }[] }
 type GetTileDcp = { href: string; Constraint?: { name: string; AllowedValues?: { Value?: string[] } }[] }
 export type WmtsTiles = QuadGrid & { matrixSet: string; bounds?: Bounds; tileUrl: (level: string, col: string, row: string) => string }
 
@@ -115,7 +115,7 @@ export function resolveWmtsTiles(capabilities: Capabilities, wmtsLayerId: string
   const candidates = (layer.TileMatrixSetLink ?? []).flatMap((link) => {
     const matrixSet = matrixSetsOf(capabilities).find((set) => set.Identifier === link.TileMatrixSet)
     if (!matrixSet) return []
-    const grid = quadGrid(matrixSet.SupportedCRS ?? '', (matrixSet.TileMatrix ?? []).map((matrix) => ({ id: matrix.Identifier, matrixWidth: matrix.MatrixWidth, matrixHeight: matrix.MatrixHeight, tileWidth: matrix.TileWidth, tileHeight: matrix.TileHeight, origin: matrix.TopLeftCorner })))
+    const grid = quadGrid(matrixSet.SupportedCRS ?? '', (matrixSet.TileMatrix ?? []).map((matrix) => ({ id: matrix.Identifier, matrixWidth: matrix.MatrixWidth, matrixHeight: matrix.MatrixHeight, tileWidth: matrix.TileWidth, tileHeight: matrix.TileHeight, origin: matrix.TopLeftCorner, scaleDenominator: matrix.ScaleDenominator })))
     if (typeof grid === 'string') { reasons.push(`${link.TileMatrixSet}: ${grid}`); return [] }
     // TileMatrixSetLimits narrows the levels the layer actually has tiles for.
     const limited = (link.TileMatrixSetLimits ?? []).map((limit) => Number(limit.TileMatrix.slice(grid.prefix.length))).filter(Number.isInteger)

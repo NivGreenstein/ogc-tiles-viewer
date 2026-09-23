@@ -107,7 +107,7 @@ function App() {
       const choice = choices[tileset.id]
       const matrixSet = await loadMatrixSet(tileset, choice?.matrixUrl, nextDiagnostics)
       setDiagnostics(nextDiagnostics)
-      const grid = quadGrid(matrixSet.crs, matrixSet.tileMatrices.map((matrix) => ({ id: matrix.id, matrixWidth: matrix.matrixWidth, matrixHeight: matrix.matrixHeight, tileWidth: matrix.tileWidth, tileHeight: matrix.tileHeight, origin: matrix.pointOfOrigin })))
+      const grid = quadGrid(matrixSet.crs, matrixSet.tileMatrices.map((matrix) => ({ id: matrix.id, matrixWidth: matrix.matrixWidth, matrixHeight: matrix.matrixHeight, tileWidth: matrix.tileWidth, tileHeight: matrix.tileHeight, origin: matrix.pointOfOrigin, scaleDenominator: matrix.scaleDenominator, cellSize: matrix.cellSize })))
       const tileLink = choice ? { href: choice.tileUrl } : byRel(tileset.links, ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'])
       if (!tileLink) throw new Error('This tileset does not advertise a tile URL template.')
       const key = `${tileset.id}:${matrixSet.id}`
@@ -156,7 +156,7 @@ function App() {
         if (!drawableIn(next, worldCrs)) {
           // A raster with only a Web Mercator grid cannot be drawn on a WorldCRS84Quad map; planRaster explains why otherwise.
           crs = worldCrs === 'WorldCRS84Quad' ? 'WebMercatorQuad' : 'WorldCRS84Quad'
-          planRaster(next, crs)
+          try { planRaster(next, crs) } catch (error) { throw new Error(`${describe(error)} Switch the engine to OpenLayers to draw it.`) }
           const switched = switchWorldCrs(crs)
           if (!switched) return
           kept = switched

@@ -4,9 +4,11 @@ export const quadLabel: Record<WorldCrs, string> = { WorldCRS84Quad: 'WorldCRS84
 export type Bounds = [west: number, south: number, east: number, north: number]
 // The grid a MapLibre source can address: tile matrix level L is `${prefix}${L}` in the service's own identifiers.
 export type QuadGrid = { quad: WorldCrs; prefix: string; minLevel: number; maxLevel: number; tileSize: number }
-type GridMatrix = { id: string; matrixWidth: number; matrixHeight: number; tileWidth: number; tileHeight: number; origin: number[] }
+type GridMatrix = { id: string; matrixWidth: number; matrixHeight: number; tileWidth: number; tileHeight: number; origin: number[]; scaleDenominator: number; cellSize?: number }
 
 const mercatorEdge = 20037508.342789244
+// OGC scale denominators assume 0.28 mm pixels; a degree is converted at the WGS 84 equator.
+const metersPerDegree = 2 * Math.PI * 6378137 / 360
 const mercatorCodes = ['3857', '900913', '3785', '102100', '102113']
 const epsgCode = (crs: string) => crs.match(/EPSG.*?[:/](\d+)$/i)?.[1] ?? crs.match(/^\d+$/)?.[0]
 const near = (value: number, target: number, tolerance: number) => Math.abs(Math.abs(value) - target) <= tolerance
@@ -34,6 +36,10 @@ export function quadGrid(crs: string, matrices: GridMatrix[]): QuadGrid | string
     const [x = NaN, y = NaN] = matrix.origin
     const originOk = quad === 'WorldCRS84Quad' ? (near(x, 180, 1e-6) && near(y, 90, 1e-6)) || (near(x, 90, 1e-6) && near(y, 180, 1e-6)) : near(x, mercatorEdge, 1) && near(y, mercatorEdge, 1)
     if (!originOk) return `Tile matrix ${matrix.id} has its origin at ${matrix.origin.join(', ')}, not the corner of the ${quad} world.`
+    // A matrix of the right shape can still span more than the world, as NASA GIBS' 512 px EPSG:4326 tiles do.
+    const pixelSize = matrix.cellSize || matrix.scaleDenominator * 0.00028 / (quad === 'WorldCRS84Quad' ? metersPerDegree : 1)
+    const expected = (quad === 'WorldCRS84Quad' ? 180 : 2 * mercatorEdge) / tileSize / 2 ** level
+    if (!(Math.abs(pixelSize / expected - 1) < 0.01)) return `Tile matrix ${matrix.id} tiles span ${(pixelSize * tileSize).toPrecision(4)} ${quad === 'WorldCRS84Quad' ? 'degrees' : 'metres'}, not the ${(expected * tileSize).toPrecision(4)} of ${quad} level ${level}.`
     if (!matrix.id.endsWith(String(level))) return `Tile matrix ${matrix.id} is level ${level}, so its identifier cannot be derived from the level.`
     const matrixPrefix = matrix.id.slice(0, matrix.id.length - String(level).length)
     if (prefix !== undefined && matrixPrefix !== prefix) return 'Tile matrix identifiers do not follow one naming pattern.'

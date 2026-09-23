@@ -101,6 +101,7 @@ Our WMTS raster provider serves EPSG:4326 `WorldCRS84Quad` tiles only:
 - On a **WorldCRS84Quad** map the tiles are drawn natively.
 - On a **WebMercatorQuad** map a layer's EPSG:3857 matrix set is used when it has one. Otherwise its EPSG:4326 tiles are reprojected in the browser by [`@nivgreen/maplibre-gl-raster-reprojection`](https://github.com/NivGreenstein/maplibre-gl-raster-reprojection), which requests the level below each mercator tile. The plugin fetches source tiles itself and does not send the `x-api-key` header, so a raster behind an API-key header draws only on a WorldCRS84Quad map.
 - A raster with only an EPSG:3857 matrix set cannot be drawn on a WorldCRS84Quad map, so adding one asks before switching the map to WebMercatorQuad.
+- A matrix set is only drawn by MapLibre when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. NASA GIBS' EPSG:4326 sets, for example, use 512 px tiles that span 288 degrees at level 0, so MapLibre refuses them and OpenLayers draws them.
 
 OpenLayers draws WMTS rasters with `ol/source/WMTS`, preferring a matrix set in the map's projection and otherwise reprojecting.
 
