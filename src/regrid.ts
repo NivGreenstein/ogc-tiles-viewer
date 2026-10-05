@@ -1,6 +1,5 @@
 import type { AddProtocolAction } from '@nivgreen/maplibre-gl-js-crs84'
 import type { PlateCarreeTiles } from './wmts'
-import { apiKeyHeaders } from './wmts'
 import type { WorldCrs } from './types'
 
 // Draws plate carrée WMTS tiles that do not line up with the map's tile grid, such as NASA GIBS' 512 px EPSG:4326
@@ -8,7 +7,7 @@ import type { WorldCrs } from './types'
 // plate carrée, so one scaled copy is exact; on a Web Mercator map the tile is resampled one pixel row at a time.
 export const regridProtocol = 'regrid'
 const tileSize = 256
-type Entry = { tiles: PlateCarreeTiles; apiKey: string; worldCrs: WorldCrs }
+type Entry = { tiles: PlateCarreeTiles; worldCrs: WorldCrs }
 const sources = new Map<string, Entry>()
 const images = new Map<string, Promise<ImageBitmap | null>>()
 
@@ -24,12 +23,12 @@ export function regridMaxZoom(tiles: PlateCarreeTiles, worldCrs: WorldCrs) {
   return Math.max(0, Math.ceil(Math.log2((worldCrs === 'WorldCRS84Quad' ? 180 : 360) / tileSize / finest)))
 }
 
-function loadImage(url: string, apiKey: string) {
+function loadImage(url: string) {
   let image = images.get(url)
   if (!image) {
     // A tile outside the service's coverage fails or is empty; the rest of the map tile is still drawn. The request is
     // shared by every map tile that needs it, so one map tile being cancelled does not abort it.
-    image = fetch(url, { headers: apiKeyHeaders(apiKey) }).then(async (response) => (response.ok ? createImageBitmap(await response.blob()) : null)).catch(() => null)
+    image = fetch(url).then(async (response) => (response.ok ? createImageBitmap(await response.blob()) : null)).catch(() => null)
     images.set(url, image)
     // Neighbouring map tiles share source tiles, so recent ones are kept.
     if (images.size > 96) images.delete(images.keys().next().value!)
@@ -62,7 +61,7 @@ export const regridLoader: AddProtocolAction = async ({ url }, abortController) 
   mosaic.height = (lastRow - firstRow + 1) * matrix.tileSize
   const mosaicContext = mosaic.getContext('2d')!
   for (let row = firstRow; row <= lastRow; row++) for (let column = firstColumn; column <= lastColumn; column++) {
-    requests.push(loadImage(entry.tiles.matrixUrl(matrix.id, String(column), String(row)), entry.apiKey).then((image) => {
+    requests.push(loadImage(entry.tiles.matrixUrl(matrix.id, String(column), String(row))).then((image) => {
       if (image) mosaicContext.drawImage(image, (column - firstColumn) * matrix.tileSize, (row - firstRow) * matrix.tileSize, matrix.tileSize, matrix.tileSize)
     }))
   }

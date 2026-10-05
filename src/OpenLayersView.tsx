@@ -16,6 +16,8 @@ import TileGrid from 'ol/tilegrid/TileGrid'
 import Overlay from 'ol/Overlay'
 import TileState from 'ol/TileState'
 import type ImageTile from 'ol/ImageTile'
+import type VectorTile from 'ol/VectorTile'
+import type RenderFeature from 'ol/render/Feature'
 import { defaults as defaultControls, ScaleLine } from 'ol/control'
 import { fromLonLat, get as getProjection, toLonLat, transformExtent } from 'ol/proj'
 import { applyStyle } from 'ol-mapbox-style'
@@ -23,7 +25,8 @@ import 'ol/ol.css'
 import { FeaturePopup } from './FeaturePopup'
 import type { Hit } from './FeaturePopup'
 import { metersPerPixelFromZoom, viewMemory, zoomFromMetersPerPixel } from './viewMemory'
-import { apiKeyHeaders, findLayer } from './wmts'
+import { findLayer } from './wmts'
+import { headersFor } from './requestHeaders'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError } from './types'
 
 type GlStyle = Parameters<typeof applyStyle>[1]
@@ -37,19 +40,19 @@ function wmtsSource(raster: ActiveRaster, projection: string | undefined) {
   if (!options) throw new Error(`OpenLayers could not build WMTS options for ${raster.title}.`)
   return new WMTS({
     ...options, crossOrigin: 'anonymous', wrapX: true,
-    ...(raster.apiKey ? {
-      tileLoadFunction: (tile, src) => {
-        const image = (tile as ImageTile).getImage() as HTMLImageElement
-        fetch(src, { headers: apiKeyHeaders(raster.apiKey) }).then((response) => {
-          if (!response.ok) throw new Error(`HTTP ${response.status}`)
-          return response.blob()
-        }).then((blob) => {
-          const objectUrl = URL.createObjectURL(blob)
-          image.onload = () => URL.revokeObjectURL(objectUrl)
-          image.src = objectUrl
-        }).catch(() => tile.setState(TileState.ERROR))
-      },
-    } : {}),
+    // An <img> cannot send headers, so tiles that need them are fetched and handed over as blobs.
+    tileLoadFunction: (tile, src) => {
+      const image = (tile as ImageTile).getImage() as HTMLImageElement
+      if (!headersFor(src).length) { image.src = src; return }
+      fetch(src).then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.blob()
+      }).then((blob) => {
+        const objectUrl = URL.createObjectURL(blob)
+        image.onload = () => URL.revokeObjectURL(objectUrl)
+        image.src = objectUrl
+      }).catch(() => tile.setState(TileState.ERROR))
+    },
   })
 }
 
@@ -132,6 +135,19 @@ export function OpenLayersView({ layers, rasters, order, appliedStyle, showTileD
       const meters = projection.getMetersPerUnit() ?? 1
       const grid = new TileGrid({ extent: layer.tileset.boundingBox && (!layer.tileset.boundingBox.crs || layer.tileset.boundingBox.crs === layer.matrixSet.crs) ? [...layer.tileset.boundingBox.lowerLeft, ...layer.tileset.boundingBox.upperRight] : undefined, origins: matrices.map((m) => m.pointOfOrigin), resolutions: matrices.map((m) => m.cellSize || m.scaleDenominator * 0.00028 / meters), tileSizes: matrices.map((m) => [m.tileWidth, m.tileHeight]) })
       const source = new VectorTileSource({ format: new MVT(), projection, tileGrid: grid, tileUrlFunction: ([z, x, y]) => layer.tileUrl.replace(/\{tileMatrix\}/gi, matrices[z].id).replace(/\{tileCol\}/gi, String(x)).replace(/\{tileRow\}/gi, String(y)) })
+      // OpenLayers loads vector tiles with XMLHttpRequest; fetching them instead lets them carry the request headers.
+      source.setTileLoadFunction((tile, url) => {
+        const vectorTile = tile as VectorTile<RenderFeature>
+        vectorTile.setLoader((extent, _resolution, featureProjection) => {
+          fetch(url).then((response) => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            return response.arrayBuffer()
+          }).then((data) => {
+            const format = vectorTile.getFormat()
+            vectorTile.setFeatures(format.readFeatures(data, { extent, featureProjection }) as RenderFeature[])
+          }).catch(() => vectorTile.setState(TileState.ERROR))
+        })
+      })
       const tileUrlFunction = source.getTileUrlFunction()
       const vectorLayer = new VectorTileLayer({ source, declutter: Boolean(appliedStyle), zIndex: zIndex(layer.key) })
       const hue = hueFor(layer.key)

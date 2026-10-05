@@ -12,7 +12,8 @@ import type { Hit } from './FeaturePopup'
 import { viewMemory } from './viewMemory'
 import { absolute } from './ogc'
 import { regridLoader, regridMaxZoom, regridProtocol, registerRegrid } from './regrid'
-import { apiKeyHeaders, planRaster } from './wmts'
+import { planRaster } from './wmts'
+import { headersFor } from './requestHeaders'
 import type { RasterPlan } from './wmts'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError, WorldCrs } from './types'
 
@@ -98,7 +99,7 @@ addProtocol(regridProtocol, regridLoader)
 
 function rasterSource({ raster, tiles, reprojected }: RasterPlan, worldCrs: WorldCrs): StyleSpecification['sources'][string] {
   const bounds: Bounds | undefined = tiles.bounds && (reprojected ? [tiles.bounds[0], Math.max(tiles.bounds[1], -mercatorLatitude), tiles.bounds[2], Math.min(tiles.bounds[3], mercatorLatitude)] : tiles.bounds)
-  if (tiles.kind === 'plate-carree') return { type: 'raster', tiles: [registerRegrid(raster.key, { tiles, apiKey: raster.apiKey, worldCrs })], tileSize: 256, minzoom: 0, maxzoom: regridMaxZoom(tiles, worldCrs), ...(bounds ? { bounds } : {}) }
+  if (tiles.kind === 'plate-carree') return { type: 'raster', tiles: [registerRegrid(raster.key, { tiles, worldCrs })], tileSize: 256, minzoom: 0, maxzoom: regridMaxZoom(tiles, worldCrs), ...(bounds ? { bounds } : {}) }
   if (!reprojected) return { type: 'raster', tiles: [tiles.tileUrl('{z}', '{x}', '{y}')], tileSize: tiles.tileSize, minzoom: tiles.minLevel, maxzoom: tiles.maxLevel, ...(bounds ? { bounds } : {}) }
   // The plugin requests source level z - 1 for a mercator tile at z, which keeps the pixel sizes alike.
   const size = tiles.tileSize === 256 ? '' : `&ssize=${tiles.tileSize}`
@@ -154,7 +155,6 @@ function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], order: string[],
 export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, showTileDebug, hueFor, onError }: Props) {
   const mapElement = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
-  const apiKeysRef = useRef<{ prefix: string; apiKey: string }[]>([])
   const layerCountRef = useRef<number | null>(null)
   const onErrorRef = useRef(onError)
   const [popupElement] = useState(() => document.createElement('div'))
@@ -172,9 +172,10 @@ export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, s
     setWorldCRS(worldCrs)
     const map = new MapLibreMap({
       container: mapElement.current!, center: viewMemory.current?.center ?? [0, 0], zoom: viewMemory.current?.zoom ?? 1, attributionControl: false,
+      // Requests MapLibre makes in its workers bypass the page's fetch, so they get the headers here.
       transformRequest: (url) => {
-        const apiKey = apiKeysRef.current.find((entry) => url.startsWith(entry.prefix))?.apiKey
-        return apiKey ? { url, headers: apiKeyHeaders(apiKey) } : { url }
+        const headers = headersFor(url)
+        return headers.length ? { url, headers: Object.fromEntries(headers) } : { url }
       },
     })
     map.addControl(new NavigationControl({ showCompass: false }), 'top-left')
@@ -215,8 +216,6 @@ export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, s
         return []
       }
     })
-    // Resampled tiles are fetched by their own protocols, which send the key themselves where they can.
-    apiKeysRef.current = plans.flatMap(({ raster, tiles, reprojected }) => (raster.apiKey && !reprojected && tiles.kind === 'quad' ? [{ prefix: tiles.tileUrl('{z}', '{x}', '{y}').split('{')[0], apiKey: raster.apiKey }] : []))
     map.setStyle(buildStyle(layers, plans, order, appliedStyle, hueFor, worldCrs), { diff: true })
     map.showTileBoundaries = showTileDebug
     const extents: { key: string; bounds?: Bounds }[] = [

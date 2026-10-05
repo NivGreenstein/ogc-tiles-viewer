@@ -118,3 +118,15 @@ strong, small, .message, .popup pre, .popup option, .tileset select, dd, details
 .layer-order li.drop-below { box-shadow: inset 0 -3px #c8f261; }
 .drag-handle { flex: none; width: 20px; height: 28px; padding: 0; border: 0; border-radius: 4px; color: #8e9d91; background: transparent; font-size: 15px; line-height: 1; cursor: grab; }
 .drag-handle:hover, .drag-handle:focus-visible { color: #e8f8c4; background: #253220; outline: none; box-shadow: 0 0 0 2px #c8f26155; }
+
+.headers-panel { margin-bottom: 20px; padding-top: 0 !important; border-top: 0 !important; }
+.headers-panel > small { margin: 6px 0 8px; }
+.header-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) minmax(0, 1fr) auto 24px; gap: 5px; align-items: center; margin-bottom: 8px; padding: 7px; border: 1px solid #304038; border-radius: 5px; background: #111814; }
+.header-row.disabled { opacity: .55; }
+.header-row input { padding: 6px 7px; font: 11px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.header-row input[type='checkbox'] { width: 14px; height: 14px; margin: 0; accent-color: #c8f261; }
+.header-row .header-host { grid-column: 2 / -1; }
+.header-row .icon { height: 26px; padding: 0 6px; border: 1px solid #506258; border-radius: 4px; color: #b8c8b9; background: #19231d; font: 700 9px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.header-row .icon:hover { border-color: #c8f261; color: #e8f8c4; }
+.add-header { width: 100%; padding: 7px; border: 1px dashed #506258; border-radius: 5px; color: #b8c8b9; background: transparent; font: 700 9px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; }
+.add-header:hover { border-color: #c8f261; color: #e8f8c4; }

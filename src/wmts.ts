@@ -17,14 +17,13 @@ export type QuadTiles = QuadGrid & { kind: 'quad'; matrixSet: string; bounds?: B
 export type PlateCarreeTiles = { kind: 'plate-carree'; matrixSet: string; matrices: PlateCarreeMatrix[]; bounds?: Bounds; matrixUrl: (matrix: string, col: string, row: string) => string }
 export type WmtsTiles = QuadTiles | PlateCarreeTiles
 
-export const apiKeyHeaders = (apiKey: string): Record<string, string> => (apiKey ? { 'x-api-key': apiKey } : {})
 const capabilitiesCache = new Map<string, Promise<Capabilities>>()
 const layersOf = (capabilities: Capabilities) => ((capabilities.Contents as { Layer?: WmtsLayer[] } | undefined)?.Layer ?? []).filter((layer) => layer.Identifier)
 const matrixSetsOf = (capabilities: Capabilities) => (capabilities.Contents as { TileMatrixSet?: WmtsMatrixSet[] } | undefined)?.TileMatrixSet ?? []
 
-async function fetchText(url: string, apiKey: string, diagnostics: Diagnostic[], init?: RequestInit) {
+async function fetchText(url: string, diagnostics: Diagnostic[], init?: RequestInit) {
   try {
-    const response = await fetch(url, { ...init, headers: { ...apiKeyHeaders(apiKey), ...init?.headers } })
+    const response = await fetch(url, init)
     const text = await response.text()
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 500)}`)
     return text
@@ -34,11 +33,11 @@ async function fetchText(url: string, apiKey: string, diagnostics: Diagnostic[],
   }
 }
 
-export function loadCapabilities(url: string, apiKey: string, diagnostics: Diagnostic[]) {
-  const cacheKey = `${url}::${apiKey}`
+export function loadCapabilities(url: string, diagnostics: Diagnostic[]) {
+  const cacheKey = url
   let loading = capabilitiesCache.get(cacheKey)
   if (!loading) {
-    loading = fetchText(url, apiKey, diagnostics).then((text) => {
+    loading = fetchText(url, diagnostics).then((text) => {
       const parsed = new WMTSCapabilities().read(text) as Capabilities | null
       if (!parsed || !layersOf(parsed).length) throw new Error('The response is not a WMTS capabilities document with layers.')
       return parsed
@@ -72,11 +71,11 @@ const getRecordsRequest = (startPosition: number, maxRecords: number) => `<?xml 
 const byTag = (parent: Element | Document, names: string[]) => names.map((name) => [...parent.getElementsByTagName(name)]).find((nodes) => nodes.length) ?? []
 const firstText = (parent: Element, names: string[]) => byTag(parent, names).map((node) => node.textContent?.trim() ?? '').find(Boolean) ?? ''
 
-export async function loadCswCatalog(url: string, apiKey: string, diagnostics: Diagnostic[]) {
+export async function loadCswCatalog(url: string, diagnostics: Diagnostic[]) {
   const entries = new Map<string, RasterEntry>()
   const maxRecords = 100
   for (let startPosition = 1; startPosition > 0;) {
-    const text = await fetchText(url, apiKey, diagnostics, { method: 'POST', headers: { 'Content-Type': 'application/xml' }, body: getRecordsRequest(startPosition, maxRecords) })
+    const text = await fetchText(url, diagnostics, { method: 'POST', headers: { 'Content-Type': 'application/xml' }, body: getRecordsRequest(startPosition, maxRecords) })
     const document = new DOMParser().parseFromString(text, 'application/xml')
     if (document.getElementsByTagName('parsererror').length) throw new Error('The CSW response is not valid XML.')
     for (const record of byTag(document, ['mc:MCRasterRecord', 'MCRasterRecord'])) {

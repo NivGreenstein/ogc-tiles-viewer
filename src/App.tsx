@@ -4,6 +4,8 @@ import { crsQuad, quadGrid, quadLabel } from './crs'
 import { MapLibreView } from './MapLibreView'
 import { byRel, chooseStyleSource, discover, ensureProjection, loadMatrixSet } from './ogc'
 import { readUrlState, writeUrlState } from './urlState'
+import { setRequestHeaders } from './requestHeaders'
+import type { HeaderRow } from './requestHeaders'
 import { capabilitiesEntries, loadCapabilities, loadCswCatalog, planRaster } from './wmts'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, Choice, Diagnostic, Engine, RasterEntry, ReportError, StyleDocument, Tileset, WorldCrs } from './types'
 import './App.css'
@@ -16,6 +18,8 @@ const storedKey = 'ogc-tiles-viewer-state'
 const storedEngineKey = 'ogc-tiles-viewer-engine'
 const storedCrsKey = 'ogc-tiles-viewer-crs'
 const storedRasterKey = 'ogc-tiles-viewer-raster'
+const storedHeadersKey = 'ogc-tiles-viewer-headers'
+const storedStyleKey = 'ogc-tiles-viewer-style'
 // OpenLayers is the alternative engine, so it is only downloaded when selected.
 const OpenLayersView = lazy(() => import('./OpenLayersView').then((module) => ({ default: module.OpenLayersView })))
 const hueFor = (key: string) => [...key].reduce((hue, character) => (hue * 31 + character.charCodeAt(0)) % 360, 7)
@@ -26,11 +30,26 @@ const initialEngine = (): Engine => ((initialState.engine ?? readStored(storedEn
 const crsModes = ['auto', 'WorldCRS84Quad', 'WebMercatorQuad'] as const
 const crsModeLabel: Record<CrsMode, string> = { auto: 'AUTO', WorldCRS84Quad: 'EPSG:4326', WebMercatorQuad: 'EPSG:3857' }
 const initialCrsMode = (): CrsMode => crsModes.find((mode) => mode === (initialState.crs ?? readStored(storedCrsKey))) ?? 'auto'
-const initialRaster = (): { mode: RasterMode; url: string } => {
+type RasterSource = { mode: RasterMode; urls: Record<RasterMode, string> }
+// Each source type keeps its own URL, so switching between WMTS and CSW loses neither.
+const initialRaster = (): RasterSource => {
+  let stored: Partial<RasterSource> & { url?: string } = {}
+  try { stored = JSON.parse(readStored(storedRasterKey) ?? '{}') } catch { /* starts empty */ }
+  const mode: RasterMode = stored.mode === 'csw' ? 'csw' : 'wmts'
+  // Saved before each source type kept its own URL.
+  const urls = { wmts: '', csw: '', ...(stored.url ? { [mode]: stored.url } : {}), ...stored.urls }
   const { csw, wmts } = initialState
-  if (csw) return { mode: 'csw', url: csw }
-  if (wmts) return { mode: 'wmts', url: wmts }
-  try { return { mode: 'wmts', url: '', ...JSON.parse(readStored(storedRasterKey) ?? '{}') } } catch { return { mode: 'wmts', url: '' } }
+  if (csw) return { mode: 'csw', urls: { ...urls, csw } }
+  if (wmts) return { mode: 'wmts', urls: { ...urls, wmts } }
+  return { mode, urls }
+}
+const newHeaderRow = (): HeaderRow => ({ id: crypto.randomUUID(), enabled: true, name: '', value: '', host: '' })
+const initialHeaders = (): HeaderRow[] => {
+  try {
+    const stored = JSON.parse(readStored(storedHeadersKey) ?? 'null') as HeaderRow[] | null
+    if (Array.isArray(stored) && stored.length) return stored.map((row) => ({ ...newHeaderRow(), ...row }))
+  } catch { /* starts with one empty row */ }
+  return [newHeaderRow()]
 }
 // Whether the MapLibre map can draw a raster in the given world CRS, natively or reprojected.
 const drawableIn = (raster: ActiveRaster, worldCrs: WorldCrs) => { try { planRaster(raster, worldCrs); return true } catch { return false } }
@@ -65,11 +84,18 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [metadata, setMetadata] = useState<Tileset | null>(null)
   const [openMatrixSets, setOpenMatrixSets] = useState<Record<string, boolean>>({})
-  const [styleInput, setStyleInput] = useState('')
+  const [styleInput, setStyleInput] = useState(() => readStored(storedStyleKey) ?? '')
   const [appliedStyle, setAppliedStyle] = useState<AppliedStyle | null>(null)
   const [showTileDebug, setShowTileDebug] = useState(true)
   const [raster, setRaster] = useState(initialRaster)
-  const [apiKey, setApiKey] = useState('')
+  const [headers, setHeaders] = useState(initialHeaders)
+  // Open until headers are configured, then out of the way.
+  const [headersOpen, setHeadersOpen] = useState(() => !headers.some((row) => row.name.trim()))
+  const [shownHeaderValues, setShownHeaderValues] = useState<Record<string, boolean>>({})
+  // Applied during render, so a request started by this render's handlers already carries the latest headers.
+  setRequestHeaders(headers)
+  const rasterUrl = raster.urls[raster.mode]
+  const updateHeader = (id: string, change: Partial<HeaderRow>) => setHeaders((rows) => rows.map((row) => (row.id === id ? { ...row, ...change } : row)))
   const [rasterCatalog, setRasterCatalog] = useState<RasterEntry[]>([])
   const [rasterLoading, setRasterLoading] = useState(false)
   const [rasters, setRasters] = useState<ActiveRaster[]>([])
@@ -103,15 +129,17 @@ function App() {
       localStorage.setItem(storedEngineKey, engine)
       localStorage.setItem(storedCrsKey, crsMode)
       localStorage.setItem(storedRasterKey, JSON.stringify(raster))
+      localStorage.setItem(storedStyleKey, styleInput)
+      localStorage.setItem(storedHeadersKey, JSON.stringify(headers))
     } catch { /* the viewer works without persisted state */ }
     writeUrlState({
       endpoint,
       engine: engine === 'maplibre' ? undefined : engine,
       crs: engine === 'maplibre' && crsMode !== 'auto' ? crsMode : undefined,
-      wmts: raster.mode === 'wmts' ? raster.url : undefined,
-      csw: raster.mode === 'csw' ? raster.url : undefined,
+      wmts: raster.mode === 'wmts' ? raster.urls.wmts : undefined,
+      csw: raster.mode === 'csw' ? raster.urls.csw : undefined,
     })
-  }, [endpoint, engine, crsMode, raster])
+  }, [endpoint, engine, crsMode, raster, styleInput, headers])
 
   async function submit(event: FormEvent) {
     event.preventDefault(); setLoading(true); setDiagnostics([]); setTilesets([]); setActive([])
@@ -219,8 +247,8 @@ function App() {
     event.preventDefault(); setRasterLoading(true); setRasterCatalog([])
     const nextDiagnostics: Diagnostic[] = []
     try {
-      const url = new URL(raster.url).toString()
-      const entries = raster.mode === 'csw' ? await loadCswCatalog(url, apiKey, nextDiagnostics) : capabilitiesEntries(await loadCapabilities(url, apiKey, nextDiagnostics), url)
+      const url = new URL(rasterUrl).toString()
+      const entries = raster.mode === 'csw' ? await loadCswCatalog(url, nextDiagnostics) : capabilitiesEntries(await loadCapabilities(url, nextDiagnostics), url)
       setRasterCatalog(entries)
       setMessage(entries.length ? `Found ${entries.length} raster layer${entries.length === 1 ? '' : 's'}. Select + to add one.` : `The ${raster.mode === 'csw' ? 'CSW catalog' : 'WMTS service'} lists no raster layers.`)
     } catch (error) { setMessage(`Could not load the ${raster.mode === 'csw' ? 'CSW catalog' : 'WMTS capabilities'}: ${describe(error)}`) } finally {
@@ -231,8 +259,8 @@ function App() {
   async function addRaster(entry: RasterEntry) {
     const nextDiagnostics: Diagnostic[] = []
     try {
-      const capabilities = await loadCapabilities(entry.capabilitiesUrl, apiKey, nextDiagnostics)
-      const next: ActiveRaster = { key: rasterKey(entry), title: entry.title, capabilities, wmtsLayerId: entry.wmtsLayerId, apiKey }
+      const capabilities = await loadCapabilities(entry.capabilitiesUrl, nextDiagnostics)
+      const next: ActiveRaster = { key: rasterKey(entry), title: entry.title, capabilities, wmtsLayerId: entry.wmtsLayerId }
       let kept = { keptLayers: active, keptRasters: rasters }
       let note = ''
       if (engine === 'maplibre') {
@@ -244,7 +272,7 @@ function App() {
         kept = placed
         const plan = planRaster(next, placed.crs)
         if (plan.tiles.kind === 'plate-carree') note = ` Its ${plan.tiles.matrixSet} tiles do not follow the ${placed.crs} grid, so they are resampled in the browser.`
-        else if (plan.reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser${apiKey ? '; the reprojection plugin fetches them without the x-api-key header' : ''}.`
+        else if (plan.reprojected) note = ` Its EPSG:4326 tiles are reprojected to Web Mercator in the browser.`
       }
       setActive(kept.keptLayers)
       setRasters([...kept.keptRasters.filter((item) => item.key !== next.key), next])
@@ -300,13 +328,25 @@ function App() {
             <small>{crsMode === 'auto' ? `Follows the layers, now ${quadLabel[worldCrs]}. Each layer is drawn in its own grid when the others allow it; otherwise EPSG:4326 rasters are reprojected.` : worldCrs === 'WorldCRS84Quad' ? 'Tiles are requested and drawn natively in EPSG:4326.' : 'EPSG:4326 rasters are reprojected to Web Mercator in the browser.'}</small></>
           : <small>OpenLayers follows the first layer&apos;s advertised CRS and grid, for any EPSG code.</small>}
       </section>
+      <details className="headers-panel" open={headersOpen} onToggle={(event) => { const isOpen = event.currentTarget.open; setHeadersOpen(isOpen) }}>
+        <summary>REQUEST HEADERS <b>{headers.filter((row) => row.enabled && row.name.trim()).length}</b></summary>
+        <small>Sent with every request to another site: discovery, capabilities, CSW, styles and tiles. A host limits a header to that host and its subdomains. Saved in this browser&apos;s local storage.</small>
+        {headers.map((row, index) => <div className={row.enabled ? 'header-row' : 'header-row disabled'} key={row.id}>
+          <input type="checkbox" checked={row.enabled} onChange={(e) => updateHeader(row.id, { enabled: e.target.checked })} aria-label={`Send header ${index + 1}`} />
+          <input aria-label={`Header ${index + 1} name`} placeholder="Header, e.g. x-api-key" value={row.name} onChange={(e) => updateHeader(row.id, { name: e.target.value })} autoComplete="off" spellCheck={false} />
+          <input aria-label={`Header ${index + 1} value`} placeholder="Value" type={shownHeaderValues[row.id] ? 'text' : 'password'} value={row.value} onChange={(e) => updateHeader(row.id, { value: e.target.value })} autoComplete="off" spellCheck={false} />
+          <button type="button" className="icon" aria-label={`${shownHeaderValues[row.id] ? 'Hide' : 'Show'} header ${index + 1} value`} aria-pressed={Boolean(shownHeaderValues[row.id])} onClick={() => setShownHeaderValues((shown) => ({ ...shown, [row.id]: !shown[row.id] }))}>{shownHeaderValues[row.id] ? 'HIDE' : 'SHOW'}</button>
+          <button type="button" className="icon" aria-label={`Remove header ${index + 1}`} onClick={() => setHeaders((rows) => (rows.length > 1 ? rows.filter((item) => item.id !== row.id) : [newHeaderRow()]))}>×</button>
+          <input className="header-host" aria-label={`Header ${index + 1} host`} placeholder="Only for host (optional), e.g. mapcolonies.net" value={row.host} onChange={(e) => updateHeader(row.id, { host: e.target.value })} autoComplete="off" spellCheck={false} />
+        </div>)}
+        <button type="button" className="add-header" onClick={() => setHeaders((rows) => [...rows, newHeaderRow()])}>+ ADD HEADER</button>
+      </details>
       <form onSubmit={submit}><label htmlFor="endpoint">API LANDING PAGE</label><div className="endpoint"><input id="endpoint" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} placeholder="https://example.org/ogc" /><button disabled={loading}>{loading ? '...' : 'DISCOVER'}</button></div></form>
       <p className="message">{message}</p><section><h2>STYLE {appliedStyle && <b>{appliedStyle.layerCount}</b>}</h2><div className="endpoint style"><textarea aria-label="MapLibre style URL or document" value={styleInput} onChange={(event) => setStyleInput(event.target.value)} placeholder="MapLibre style URL, or paste a style JSON document" spellCheck={false} /><button type="button" onClick={() => void loadStyle()}>APPLY</button></div><small>{appliedStyle ? `Drawing source “${appliedStyle.source}”. Empty the field and select APPLY for the generated style.` : 'Blank uses a generated style colored by geometry type.'}</small></section><label className="debug-toggle"><input type="checkbox" checked={showTileDebug} onChange={(event) => setShowTileDebug(event.target.checked)} /> SHOW Z/X/Y TILE GRID</label><section><h2>CATALOG <b>{tilesets.length}</b></h2>{Object.entries(groupedTilesets).sort(([a], [b]) => a.localeCompare(b)).map(([matrixSet, entries]) => <details className="matrix-group" key={matrixSet} open={openMatrixSets[matrixSet] ?? true} onToggle={(event) => { const isOpen = event.currentTarget.open; setOpenMatrixSets((current) => ({ ...current, [matrixSet]: isOpen })) }}><summary>{matrixSet} <b>{entries.length}</b></summary>{entries.map((set) => { const tileLinks = set.links.filter((link) => ['item', 'tile', 'http://www.opengis.net/def/rel/ogc/1.0/tiles'].includes(link.rel ?? '')); const matrixLinks = set.links.filter((link) => ['http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme', 'tiling-scheme', 'tileMatrixSet'].includes(link.rel ?? '')); const choice = choices[set.id]; return <article className="tileset catalog-item" key={set.id}><div><strong>{set.title}</strong><small>{set.dataType ?? 'vector'} · {set.crs ?? 'CRS from matrix set'}</small>{tileLinks.length > 0 && <select aria-label={`Tile format for ${set.title}`} value={choice?.tileUrl ?? tileLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: e.target.value, matrixUrl: choice?.matrixUrl ?? matrixLinks[0]?.href ?? '' } }))}>{tileLinks.map((link) => <option key={link.href} value={link.href}>{link.title ? `${link.title} (${link.type ?? 'format unspecified'})` : link.type ?? 'Format unspecified'}</option>)}</select>}{matrixLinks.length > 1 && <select value={choice?.matrixUrl ?? matrixLinks[0].href} onChange={(e) => setChoices((old) => ({ ...old, [set.id]: { tileUrl: choice?.tileUrl ?? tileLinks[0]?.href ?? '', matrixUrl: e.target.value } }))}>{matrixLinks.map((link) => <option key={link.href} value={link.href}>{link.title ?? link.href}</option>)}</select>}</div><button className="info" onClick={() => setMetadata(set)}>i</button><button className="add" onClick={() => void addLayer(set)} aria-label={`Add ${set.title}`}>+</button></article> })}</details>)}</section>
       <section><h2>RASTER <b>{rasterCatalog.length}</b></h2>
         <form onSubmit={loadRasterCatalog}>
           <div className="segmented" role="radiogroup" aria-label="Raster catalog type">{([['wmts', 'WMTS CAPABILITIES'], ['csw', 'MAPCOLONIES CSW']] as const).map(([mode, label]) => <button type="button" key={mode} role="radio" aria-checked={raster.mode === mode} className={raster.mode === mode ? 'selected' : ''} onClick={() => { setRaster((current) => ({ ...current, mode })); setRasterCatalog([]) }}>{label}</button>)}</div>
-          <div className="endpoint"><input aria-label={raster.mode === 'csw' ? 'CSW URL' : 'WMTS capabilities URL'} value={raster.url} onChange={(e) => setRaster((current) => ({ ...current, url: e.target.value }))} placeholder={raster.mode === 'csw' ? 'https://example.org/raster-catalog/csw' : 'https://example.org/wmts/1.0.0/WMTSCapabilities.xml'} /><button disabled={rasterLoading}>{rasterLoading ? '...' : 'LOAD'}</button></div>
-          <div className="endpoint"><input type="password" aria-label="API key" autoComplete="off" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Optional x-api-key" /></div>
+          <div className="endpoint"><input aria-label={raster.mode === 'csw' ? 'CSW URL' : 'WMTS capabilities URL'} value={rasterUrl} onChange={(e) => { const url = e.target.value; setRaster((current) => ({ ...current, urls: { ...current.urls, [current.mode]: url } })) }} placeholder={raster.mode === 'csw' ? 'https://example.org/raster-catalog/csw' : 'https://example.org/wmts/1.0.0/WMTSCapabilities.xml'} /><button disabled={rasterLoading}>{rasterLoading ? '...' : 'LOAD'}</button></div>
         </form>
         {rasterCatalog.length > 0 && <details className="raster-drawer" open={rasterDrawerOpen} onToggle={(event) => { const isOpen = event.currentTarget.open; setRasterDrawerOpen(isOpen) }}>
           <summary>AVAILABLE LAYERS <b>{query ? `${visibleRasters.length}/${rasterCatalog.length}` : rasterCatalog.length}</b></summary>

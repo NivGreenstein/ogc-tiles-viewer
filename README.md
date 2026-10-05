@@ -20,6 +20,8 @@ The viewer does not need a backend or proxy. It follows links advertised by an O
 - Never assume Web Mercator. Missing EPSG definitions are requested from `epsg.io` and registered with `proj4`.
 - Pick the map CRS automatically from the layers you add, and keep the current view when layers are added or the CRS or engine changes.
 - Search and pick raster layers in a collapsible drawer, and reorder all layers by drag and drop.
+- Send custom request headers, such as `x-api-key`, with every request to the services, optionally per host.
+- Save URLs, the style, headers and secrets in local storage.
 - Draw Hebrew and Arabic labels correctly with the MapLibre RTL text plugin, bundled and loaded on demand.
 - Inspect all vector features hit by a map click and view their raw properties.
 - Show metadata, request diagnostics, scale, CRS, and a tile debug grid.
@@ -100,7 +102,7 @@ The **RASTER** section loads raster layers from either source:
 
 After **LOAD**, the layers the source offers are listed in the **AVAILABLE LAYERS** drawer, which can be collapsed and scrolls when the list is long. Its search field filters by title, identifier and tile matrix set, and each layer's checkbox adds it to the map or removes it.
 
-An optional API key is sent as the `x-api-key` header on CSW, capabilities, and tile requests. It is held in memory only and is never written to the URL or local storage.
+Authentication headers, such as `x-api-key`, are set under [Request Headers](#request-headers).
 
 A layer's tile URL comes from its RESTful `ResourceURL` template, or from the KVP `GetTile` endpoint when there is none, with the default style and dimension values filled in. `TileMatrixSetLimits` and `WGS84BoundingBox` limit the levels and area requested.
 
@@ -108,15 +110,27 @@ Our WMTS raster provider serves EPSG:4326 `WorldCRS84Quad` tiles only:
 
 - In AUTO, a map with no layers that cannot follow switches to WorldCRS84Quad for them, so the tiles are drawn natively.
 - On a **WorldCRS84Quad** map the tiles are drawn natively.
-- On a **WebMercatorQuad** map a layer's EPSG:3857 matrix set is used when it has one. Otherwise its EPSG:4326 tiles are reprojected in the browser by [`@nivgreen/maplibre-gl-raster-reprojection`](https://github.com/NivGreenstein/maplibre-gl-raster-reprojection), which requests the level below each mercator tile. The plugin fetches source tiles itself and does not send the `x-api-key` header, so a raster behind an API-key header draws only on a WorldCRS84Quad map.
+- On a **WebMercatorQuad** map a layer's EPSG:3857 matrix set is used when it has one. Otherwise its EPSG:4326 tiles are reprojected in the browser by [`@nivgreen/maplibre-gl-raster-reprojection`](https://github.com/NivGreenstein/maplibre-gl-raster-reprojection), which requests the level below each mercator tile. Its source tile requests carry the [request headers](#request-headers) too.
 - A raster with only an EPSG:3857 matrix set cannot be drawn on a WorldCRS84Quad map. In AUTO the map switches for it when no layer is lost, and otherwise asks.
-- A matrix set is only addressed directly when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. Other EPSG:4326 matrix sets whose tiles start at the north-west corner of the world are resampled instead. [NASA GIBS](https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/1.0.0/WMTSCapabilities.xml), for example, publishes 512 px tiles that span 288 degrees at level 0. For each map tile, the viewer picks the coarsest GIBS level at least as detailed as the tile, fetches the GIBS tiles covering it, and crops and scales them into place. On a WorldCRS84Quad map both grids are plate carrée, so this is an exact rescale. On a Web Mercator map the tile is resampled one pixel row at a time. These requests carry the `x-api-key` header.
+- A matrix set is only addressed directly when its tile sizes and scale denominators match the standard grid, not just its CRS and matrix counts. Other EPSG:4326 matrix sets whose tiles start at the north-west corner of the world are resampled instead. [NASA GIBS](https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/1.0.0/WMTSCapabilities.xml), for example, publishes 512 px tiles that span 288 degrees at level 0. For each map tile, the viewer picks the coarsest GIBS level at least as detailed as the tile, fetches the GIBS tiles covering it, and crops and scales them into place. On a WorldCRS84Quad map both grids are plate carrée, so this is an exact rescale. On a Web Mercator map the tile is resampled one pixel row at a time. These requests carry the [request headers](#request-headers).
 
 OpenLayers draws WMTS rasters with `ol/source/WMTS`, preferring a matrix set in the map's projection and otherwise reprojecting.
 
+## Request Headers
+
+**REQUEST HEADERS** is a list of headers, like Postman's, sent with every request the viewer makes to another site: OGC API discovery, tile matrix sets, styles, glyphs and sprites, WMTS capabilities, CSW, and raster and vector tiles, in both engines. Each row has a checkbox to turn it off without deleting it, a name, a value (masked, with **SHOW** to reveal it), and an optional host. A header with a host is only sent to that host and its subdomains; without one it goes to every site, including `epsg.io` when OpenLayers looks up a projection.
+
+The headers are added by wrapping the page's `fetch`, so requests that libraries make themselves, such as the raster reprojection plugin's source tiles, carry them too. MapLibre's worker requests get them through `transformRequest`, and OpenLayers loads its tiles with `fetch` rather than `<img>` or `XMLHttpRequest` when a header applies. The viewer's own files are never sent them.
+
+A custom header makes a cross-origin request preflighted, so the service must allow it in `Access-Control-Allow-Headers`. A service that does not will fail; give the header a host so it only goes where it is accepted.
+
+## Saved Settings
+
+The landing page, the WMTS and CSW URLs (each kept separately), the style field, the engine, the map CRS choice, and the request headers, values included, are saved in the browser's local storage and restored when the viewer opens. Local storage is not encrypted: anyone with access to this browser profile can read the saved secrets. A link's own values take precedence over the saved ones.
+
 ## Shareable Links
 
-The address bar carries the landing page, the WMTS or CSW URL, the engine and a pinned map CRS, so a copied link reopens the same setup. They are kept in a single `s` query parameter: JSON with one-letter keys, compressed with zlib using a preset dictionary of common OGC and WMTS URL fragments, and base64url-encoded. A typical link with a landing page and a WMTS URL comes out around 40% shorter than the plain parameters. The API key is never put in the URL.
+The address bar carries the landing page, the WMTS or CSW URL, the engine and a pinned map CRS, so a copied link reopens the same setup. They are kept in a single `s` query parameter: JSON with one-letter keys, compressed with zlib using a preset dictionary of common OGC and WMTS URL fragments, and base64url-encoded. A typical link with a landing page and a WMTS URL comes out around 40% shorter than the plain parameters. Request headers are never put in the URL.
 
 Links in the older form, with plain `endpoint`, `wmts`, `csw`, `engine` and `crs` parameters, still open, and are rewritten into the compressed form. The dictionary is part of the link format, so it must not change: a link made with a different dictionary would no longer decode.
 
@@ -169,5 +183,6 @@ src/crs.ts              WorldCRS84Quad, WebMercatorQuad and plate carrée recogn
 src/regrid.ts           Resampling of plate carrée WMTS tiles, such as NASA GIBS, onto the map grid
 src/viewMemory.ts       The last map view, shared across CRS and engine switches
 src/urlState.ts         The compressed, shareable URL state
+src/requestHeaders.ts   The request headers, and the fetch wrapper that adds them
 src/index.css           Desktop GIS workspace styling
 ```

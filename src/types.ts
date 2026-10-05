@@ -15,6 +15,6 @@ export type AppliedStyle = { document: StyleDocument; source: string; styleUrl?:
 // A parsed WMTS GetCapabilities document, as ol/format/WMTSCapabilities reads it.
 export type Capabilities = Record<string, unknown>
 export type RasterEntry = { id: string; title: string; capabilitiesUrl: string; wmtsLayerId: string; matrixSets: string[] }
-export type ActiveRaster = { key: string; title: string; capabilities: Capabilities; wmtsLayerId: string; apiKey: string }
+export type ActiveRaster = { key: string; title: string; capabilities: Capabilities; wmtsLayerId: string }
 export type Engine = 'maplibre' | 'openlayers'
 export type ReportError = (diagnostic: Omit<Diagnostic, 'at'>, message?: string) => void
