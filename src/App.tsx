@@ -89,8 +89,8 @@ function App() {
   const [showTileDebug, setShowTileDebug] = useState(true)
   const [raster, setRaster] = useState(initialRaster)
   const [headers, setHeaders] = useState(initialHeaders)
-  // Open until headers are configured, then out of the way.
-  const [headersOpen, setHeadersOpen] = useState(() => !headers.some((row) => row.name.trim()))
+  // Closed until opened, so the headers and their secrets stay out of the way.
+  const [headersOpen, setHeadersOpen] = useState(false)
   const [shownHeaderValues, setShownHeaderValues] = useState<Record<string, boolean>>({})
   // Applied during render, so a request started by this render's handlers already carries the latest headers.
   setRequestHeaders(headers)
