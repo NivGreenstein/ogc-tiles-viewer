@@ -1,13 +1,14 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Map as MapLibreMap, NavigationControl, Popup, ScaleControl, addProtocol, getRTLTextPluginStatus, setRTLTextPlugin, setWorkerUrl, setWorldCRS } from '@nivgreen/maplibre-gl-js-crs84'
+import type { GeoJSONSource } from '@nivgreen/maplibre-gl-js-crs84'
 import { createProtocol, epsg4326ToEpsg3857Presets } from '@nivgreen/maplibre-gl-raster-reprojection'
 import '@nivgreen/maplibre-gl-js-crs84/dist/maplibre-gl.css'
 // MapLibre v6 cannot locate its worker inside a bundle; Vite emits it as a self-contained chunk.
 import workerUrl from '@nivgreen/maplibre-gl-js-crs84/dist/maplibre-gl-worker.mjs?worker&url'
 import { lonLatBounds, quadLabel } from './crs'
 import type { Bounds } from './crs'
-import { FeaturePopup } from './FeaturePopup'
+import { FeaturePopup, glowColor } from './FeaturePopup'
 import type { Hit } from './FeaturePopup'
 import { viewMemory } from './viewMemory'
 import { absolute } from './ogc'
@@ -19,6 +20,9 @@ import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError, WorldCrs } f
 
 type StyleSpecification = Exclude<Parameters<MapLibreMap['setStyle']>[0], string | null>
 type LayerSpecification = StyleSpecification['layers'][number]
+type Geometry = ReturnType<MapLibreMap['queryRenderedFeatures']>[number]['geometry']
+// A feature spanning several tiles is found once per tile, so it keeps every tile's piece of its geometry.
+type MapHit = Hit & { geometries: Geometry[] }
 type Props = { worldCrs: WorldCrs; layers: ActiveLayer[]; rasters: ActiveRaster[]; order: string[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
 
 setWorkerUrl(workerUrl)
@@ -117,7 +121,20 @@ const generatedLayers = (key: string, sourceLayer: string, hue: number): LayerSp
   ] as LayerSpecification[]
 }
 
-function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], order: string[], appliedStyle: AppliedStyle | null, hueFor: (key: string) => number, worldCrs: WorldCrs): StyleSpecification {
+// The clicked feature is drawn again above every layer: a wide blurred line under a crisp one, which reads as a glow.
+const selectionSourceId = 'selection'
+const selectionLayers = (['line-glow', 'line', 'point-glow', 'point'] as const).map((part): LayerSpecification => {
+  const base = { id: `${selectionSourceId}::${part}`, source: selectionSourceId }
+  const points = ['in', ['geometry-type'], ['literal', ['Point', 'MultiPoint']]]
+  if (part === 'line-glow') return { ...base, type: 'line', filter: ['!', points], layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': glowColor, 'line-width': 14, 'line-blur': 10, 'line-opacity': 0.75 } } as LayerSpecification
+  if (part === 'line') return { ...base, type: 'line', filter: ['!', points], layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': glowColor, 'line-width': 2.5 } } as LayerSpecification
+  if (part === 'point-glow') return { ...base, type: 'circle', filter: points, paint: { 'circle-radius': 16, 'circle-blur': 1, 'circle-color': glowColor, 'circle-opacity': 0.8 } } as LayerSpecification
+  return { ...base, type: 'circle', filter: points, paint: { 'circle-radius': 7, 'circle-color': 'transparent', 'circle-stroke-color': glowColor, 'circle-stroke-width': 2.5 } } as LayerSpecification
+})
+
+const selectionData = (selection: Geometry[]) => ({ type: 'FeatureCollection' as const, features: selection.map((geometry) => ({ type: 'Feature' as const, properties: {}, geometry })) })
+
+function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], order: string[], appliedStyle: AppliedStyle | null, hueFor: (key: string) => number, worldCrs: WorldCrs, selection: Geometry[]): StyleSpecification {
   const style: StyleSpecification = { version: 8, sources: {}, layers: [] }
   const document = appliedStyle?.document
   const resolve = (href: string) => (appliedStyle?.styleUrl ? absolute(href, appliedStyle.styleUrl) : href)
@@ -149,6 +166,8 @@ function buildStyle(layers: ActiveLayer[], plans: RasterPlan[], order: string[],
   }
   const bottomUp = [...drawn.keys()].sort((a, b) => order.indexOf(b) - order.indexOf(a))
   style.layers.push(...styleLayers.filter((layer) => layer.type === 'background'), ...bottomUp.flatMap((key) => drawn.get(key) ?? []))
+  style.sources[selectionSourceId] = { type: 'geojson', data: selectionData(selection) }
+  style.layers.push(...selectionLayers)
   return style
 }
 
@@ -158,7 +177,11 @@ export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, s
   const layerCountRef = useRef<number | null>(null)
   const onErrorRef = useRef(onError)
   const [popupElement] = useState(() => document.createElement('div'))
-  const [hits, setHits] = useState<{ click: number; hits: Hit[] }>({ click: 0, hits: [] })
+  const [hits, setHits] = useState<{ hits: MapHit[]; selected: number }>({ hits: [], selected: 0 })
+  const selection = hits.hits[hits.selected]?.geometries ?? []
+  // Rebuilding the style keeps the outline of the feature selected at the time.
+  const selectionRef = useRef(selection)
+  selectionRef.current = selection
   const [layerNamesVersion, layerNamesChanged] = useReducer((version: number) => version + 1, 0)
   onErrorRef.current = onError
 
@@ -183,16 +206,16 @@ export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, s
     mapRef.current = map
     map.on('moveend', () => { viewMemory.current = { center: map.getCenter().toArray(), zoom: map.getZoom() } })
     const popup = new Popup({ closeButton: false, closeOnClick: false, maxWidth: 'none', className: 'feature-popup' }).setDOMContent(popupElement)
-    let click = 0
     map.on('click', (event) => {
-      const seen = new Set<string>()
-      const found = map.queryRenderedFeatures(event.point).filter((feature) => feature.source.startsWith('ogc:')).flatMap((feature) => {
+      const seen = new Map<string, MapHit>()
+      for (const feature of map.queryRenderedFeatures(event.point).filter((feature) => feature.source.startsWith('ogc:'))) {
         const identity = `${feature.source}|${feature.sourceLayer}|${feature.id ?? ''}|${JSON.stringify(feature.properties)}`
-        if (seen.has(identity)) return []
-        seen.add(identity)
-        return [{ layer: feature.sourceLayer, properties: feature.properties }]
-      })
-      setHits({ click: ++click, hits: found })
+        const hit = seen.get(identity)
+        if (hit) hit.geometries.push(feature.geometry)
+        else seen.set(identity, { layer: feature.sourceLayer, properties: feature.properties, geometries: [feature.geometry] })
+      }
+      const found = [...seen.values()]
+      setHits({ hits: found, selected: 0 })
       if (found.length) popup.setLngLat(event.lngLat).addTo(map)
       else popup.remove()
     })
@@ -216,7 +239,7 @@ export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, s
         return []
       }
     })
-    map.setStyle(buildStyle(layers, plans, order, appliedStyle, hueFor, worldCrs), { diff: true })
+    map.setStyle(buildStyle(layers, plans, order, appliedStyle, hueFor, worldCrs, selectionRef.current), { diff: true })
     map.showTileBoundaries = showTileDebug
     const extents: { key: string; bounds?: Bounds }[] = [
       ...layers.map((layer) => ({ key: layer.key, bounds: layer.tileset.boundingBox && lonLatBounds(layer.tileset.boundingBox.lowerLeft, layer.tileset.boundingBox.upperRight, layer.tileset.boundingBox.crs ?? layer.matrixSet.crs) })),
@@ -231,9 +254,13 @@ export function MapLibreView({ worldCrs, layers, rasters, order, appliedStyle, s
     if (target) map.fitBounds([target[0], Math.max(target[1], -worldEdge), target[2], Math.min(target[3], worldEdge)], { padding: 50, duration: 300 })
   }, [layers, rasters, order, appliedStyle, showTileDebug, hueFor, worldCrs, layerNamesVersion])
 
+  useEffect(() => {
+    mapRef.current?.getSource<GeoJSONSource>(selectionSourceId)?.setData(selectionData(hits.hits[hits.selected]?.geometries ?? []))
+  }, [hits])
+
   return <>
     <div ref={mapElement} className={appliedStyle ? 'map styled' : 'map'} />
     <div className="map-caption">{quadLabel[worldCrs]}</div>
-    {createPortal(<FeaturePopup key={hits.click} hits={hits.hits} />, popupElement)}
+    {createPortal(<FeaturePopup hits={hits.hits} selected={hits.selected} onSelect={(selected) => setHits((current) => ({ ...current, selected }))} />, popupElement)}
   </>
 }

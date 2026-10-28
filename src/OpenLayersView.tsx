@@ -3,6 +3,9 @@ import { createPortal } from 'react-dom'
 import Map from 'ol/Map'
 import View from 'ol/View'
 import VectorTileLayer from 'ol/layer/VectorTile'
+import VectorLayer from 'ol/layer/Vector'
+import VectorSource from 'ol/source/Vector'
+import type { FeatureLike } from 'ol/Feature'
 import TileLayer from 'ol/layer/Tile'
 import VectorTileSource from 'ol/source/VectorTile'
 import TileDebug from 'ol/source/TileDebug'
@@ -17,12 +20,12 @@ import Overlay from 'ol/Overlay'
 import TileState from 'ol/TileState'
 import type ImageTile from 'ol/ImageTile'
 import type VectorTile from 'ol/VectorTile'
-import type RenderFeature from 'ol/render/Feature'
+import RenderFeature, { toFeature } from 'ol/render/Feature'
 import { defaults as defaultControls, ScaleLine } from 'ol/control'
 import { fromLonLat, get as getProjection, toLonLat, transformExtent } from 'ol/proj'
 import { applyStyle } from 'ol-mapbox-style'
 import 'ol/ol.css'
-import { FeaturePopup } from './FeaturePopup'
+import { FeaturePopup, glowColor } from './FeaturePopup'
 import type { Hit } from './FeaturePopup'
 import { metersPerPixelFromZoom, viewMemory, zoomFromMetersPerPixel } from './viewMemory'
 import { findLayer } from './wmts'
@@ -30,6 +33,16 @@ import { headersFor } from './requestHeaders'
 import type { ActiveLayer, ActiveRaster, AppliedStyle, ReportError } from './types'
 
 type GlStyle = Parameters<typeof applyStyle>[1]
+// The feature is kept so the selected one can be outlined.
+type MapHit = Hit & { feature: FeatureLike }
+
+// Wide translucent strokes under a crisp one read as a glow around the selected feature.
+const glowRgba = (alpha: number) => `rgba(200, 242, 97, ${alpha})`
+const glowStyles = [
+  ...[[16, 0.12], [10, 0.22], [6, 0.4]].map(([width, alpha]) => new Style({ stroke: new Stroke({ color: glowRgba(alpha), width }), image: new CircleStyle({ radius: 6 + width / 2, fill: new Fill({ color: glowRgba(alpha) }) }) })),
+  new Style({ stroke: new Stroke({ color: glowColor, width: 2.5 }), image: new CircleStyle({ radius: 7, stroke: new Stroke({ color: glowColor, width: 2.5 }) }) }),
+]
+
 type Props = { layers: ActiveLayer[]; rasters: ActiveRaster[]; order: string[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
 
 function wmtsSource(raster: ActiveRaster, projection: string | undefined) {
@@ -62,7 +75,8 @@ export function OpenLayersView({ layers, rasters, order, appliedStyle, showTileD
   const layerCountRef = useRef<number | null>(null)
   const onErrorRef = useRef(onError)
   const [popupElement] = useState(() => document.createElement('div'))
-  const [hits, setHits] = useState<{ click: number; hits: Hit[] }>({ click: 0, hits: [] })
+  const [hits, setHits] = useState<{ hits: MapHit[]; selected: number }>({ hits: [], selected: 0 })
+  const [selectionSource] = useState(() => new VectorSource())
   const [crs, setCrs] = useState('')
   onErrorRef.current = onError
 
@@ -71,11 +85,12 @@ export function OpenLayersView({ layers, rasters, order, appliedStyle, showTileD
     mapRef.current = map
     const overlay = new Overlay({ element: popupElement, autoPan: { animation: { duration: 150 } } })
     map.addOverlay(overlay)
-    let click = 0
+    // Unmanaged, so it survives the layer list being rebuilt and is drawn above every layer.
+    new VectorLayer({ source: selectionSource, style: glowStyles }).setMap(map)
     map.on('singleclick', (event) => {
-      const found: Hit[] = []
-      map.forEachFeatureAtPixel(event.pixel, (feature) => { found.push({ properties: feature.getProperties() }); return undefined })
-      setHits({ click: ++click, hits: found }); overlay.setPosition(found.length ? event.coordinate : undefined)
+      const found: MapHit[] = []
+      map.forEachFeatureAtPixel(event.pixel, (feature) => { found.push({ properties: feature.getProperties(), feature }); return undefined })
+      setHits({ hits: found, selected: 0 }); overlay.setPosition(found.length ? event.coordinate : undefined)
     })
     map.on('moveend', () => {
       const view = map.getView()
@@ -86,7 +101,14 @@ export function OpenLayersView({ layers, rasters, order, appliedStyle, showTileD
       viewMemory.current = { center: toLonLat(center, projection) as [number, number], zoom: zoomFromMetersPerPixel(resolution * (projection.getMetersPerUnit() ?? 1)) }
     })
     return () => { map.setTarget(undefined); mapRef.current = null; layerCountRef.current = null }
-  }, [popupElement])
+  }, [popupElement, selectionSource])
+
+  useEffect(() => {
+    selectionSource.clear()
+    const feature = hits.hits[hits.selected]?.feature
+    // Vector tiles hand out lightweight render features, which a vector source cannot hold.
+    if (feature) selectionSource.addFeature(feature instanceof RenderFeature ? toFeature(feature) : feature.clone())
+  }, [hits, selectionSource])
 
   useEffect(() => {
     const map = mapRef.current
@@ -188,6 +210,6 @@ export function OpenLayersView({ layers, rasters, order, appliedStyle, showTileD
   return <>
     <div ref={mapElement} className={appliedStyle ? 'map styled' : 'map'} />
     <div className="map-caption">{crs || 'NO ACTIVE CRS'}</div>
-    {createPortal(<FeaturePopup key={hits.click} hits={hits.hits} />, popupElement)}
+    {createPortal(<FeaturePopup hits={hits.hits} selected={hits.selected} onSelect={(selected) => setHits((current) => ({ ...current, selected }))} />, popupElement)}
   </>
 }
