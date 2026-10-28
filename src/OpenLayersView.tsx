@@ -39,8 +39,9 @@ type MapHit = Hit & { feature: FeatureLike }
 // Wide translucent strokes under a crisp one read as a glow around the selected feature.
 const glowRgba = (alpha: number) => `rgba(200, 242, 97, ${alpha})`
 const glowStyles = [
-  ...[[16, 0.12], [10, 0.22], [6, 0.4]].map(([width, alpha]) => new Style({ stroke: new Stroke({ color: glowRgba(alpha), width }), image: new CircleStyle({ radius: 6 + width / 2, fill: new Fill({ color: glowRgba(alpha) }) }) })),
-  new Style({ stroke: new Stroke({ color: glowColor, width: 2.5 }), image: new CircleStyle({ radius: 7, stroke: new Stroke({ color: glowColor, width: 2.5 }) }) }),
+  new Style({ fill: new Fill({ color: glowRgba(0.25) }) }),
+  ...[[20, 0.15], [13, 0.25], [8, 0.45]].map(([width, alpha]) => new Style({ stroke: new Stroke({ color: glowRgba(alpha), width }), image: new CircleStyle({ radius: 6 + width / 2, fill: new Fill({ color: glowRgba(alpha) }) }) })),
+  new Style({ stroke: new Stroke({ color: glowColor, width: 3 }), image: new CircleStyle({ radius: 7, stroke: new Stroke({ color: glowColor, width: 3 }) }) }),
 ]
 
 type Props = { layers: ActiveLayer[]; rasters: ActiveRaster[]; order: string[]; appliedStyle: AppliedStyle | null; showTileDebug: boolean; hueFor: (key: string) => number; onError: ReportError }
